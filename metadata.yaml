@@ -1,0 +1,7 @@
+name: astrbot_plugin_ucloud
+display_name: BUPT UCloud Tasks
+desc: View BUPT Teaching Cloud tasks and receive opt-in new-task notifications.
+short_desc: BUPT Teaching Cloud task list, homework detail, and optional reminders.
+author: perrin
+version: 0.1.0
+astrbot_version: ">=4.28,<5"

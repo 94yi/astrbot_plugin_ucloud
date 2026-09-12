@@ -1,0 +1,20 @@
+{
+  "api_base_url": {
+    "type": "text",
+    "description": "UCloud API base URL",
+    "hint": "Defaults to the public BUPT Teaching Cloud API used by YouXam/ucloud.",
+    "default": "https://ucloud.youxam.workers.dev"
+  },
+  "push_enabled": {
+    "type": "bool",
+    "description": "Enable background new-task polling",
+    "hint": "Individual users can still disable their own notifications with /ucloud_push.",
+    "default": true
+  },
+  "push_interval_seconds": {
+    "type": "int",
+    "description": "New-task polling interval in seconds",
+    "hint": "Minimum effective value is 60 seconds. The default balances timeliness and API load.",
+    "default": 900
+  }
+}
