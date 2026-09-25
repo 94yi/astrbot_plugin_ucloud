@@ -3,7 +3,10 @@
 AstrBot integration for the BUPT Teaching Cloud API. It follows the direct CAS
 authentication and Teaching Cloud request flow used by
 [YouXam/ucloud](https://github.com/YouXam/ucloud) and
-[byrdocs/bupt-auth](https://github.com/byrdocs/bupt-auth). Requests go directly
+[byrdocs/bupt-auth](https://github.com/byrdocs/bupt-auth). The staged diagnostics
+and current-form compatibility were also checked against
+[94yi/MYUCLOUD](https://github.com/94yi/MYUCLOUD), without adding its hosted
+backend as a dependency. Requests go directly
 to auth.bupt.edu.cn and apiucloud.bupt.edu.cn; no public Worker or proxy is used.
 
 The protocol work is based on GPL-3.0 upstream projects, and this plugin remains
@@ -94,6 +97,16 @@ plugin logs or the WebUI configuration.
 The plugin caches access tokens in memory and refreshes them directly with the
 BUPT API. If CAS requests a captcha, it stops with a clear message instead of
 sending the session cookie or captcha to an external OCR service.
+
+The login client reads CAS hidden fields from the current form instead of
+assuming fixed values, validates that the service ticket returns only through
+the expected HTTPS UCloud callback, and preserves the previously selected role
+across restarts when it is still available. Authentication clients ignore
+process proxy environment variables so credentials cannot be silently routed
+through an unrelated proxy. Only idempotent GET requests receive one short
+connection retry; credential submission and one-time ticket exchange are never
+blindly replayed. Authentication failures carry a safe stage name for local
+diagnostics without logging passwords, cookies, tickets, or tokens.
 
 ## Submission safety and compatibility
 

@@ -234,6 +234,22 @@ async def _collect(generator: Any) -> list[Any]:
 
 
 class MainAccountTests(unittest.IsolatedAsyncioTestCase):
+    async def test_account_store_is_written_owner_only(self) -> None:
+        plugin = object.__new__(Main)
+        with tempfile.TemporaryDirectory() as directory:
+            plugin._store_path = Path(directory) / "accounts.json"
+            await plugin._write_accounts(
+                {
+                    "session-1": {
+                        "username": "student",
+                        "password": "private",
+                        "session": "session-1",
+                    }
+                }
+            )
+
+            self.assertEqual(plugin._store_path.stat().st_mode & 0o777, 0o600)
+
     async def test_login_always_verifies_supplied_password(self) -> None:
         calls: list[tuple[str, str]] = []
 
@@ -274,7 +290,30 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [("student", "new-password")])
         self.assertEqual(plugin._tokens["student"]["access_token"], "new-token")
         self.assertEqual(stored["session-1"]["password"], "new-password")
+        self.assertEqual(stored["session-1"]["identity"], "")
         self.assertIn("登录成功", replies[0])
+
+    async def test_userinfo_restores_persisted_role_after_restart(self) -> None:
+        calls: list[dict[str, Any] | None] = []
+
+        class _Client:
+            async def ensure_userinfo(
+                self, _username: str, _password: str, cached: dict[str, Any] | None
+            ) -> dict[str, Any]:
+                calls.append(cached)
+                return {"access_token": "new-token", "identity": "role-2"}
+
+        plugin = object.__new__(Main)
+        plugin._client = _Client()
+        plugin._tokens = {}
+        plugin._token_locks = {}
+
+        result = await plugin._userinfo(
+            {"username": "student", "password": "password", "identity": "role-2"}
+        )
+
+        self.assertEqual(calls, [{"identity": "role-2"}])
+        self.assertEqual(result["identity"], "role-2")
 
     async def test_logout_clears_private_in_memory_state(self) -> None:
         stored = {

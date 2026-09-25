@@ -2,12 +2,19 @@ import base64
 import json
 import time
 import unittest
+from unittest.mock import AsyncMock, Mock
+
+import httpx
 
 from astrbot_plugin_ucloud.ucloud_client import (
     DirectUCloudClient,
     UCloudLoginError,
+    UCloudUpstreamError,
+    _choose_identity,
     _extract_execution,
+    _extract_login_fields,
     _extract_login_error,
+    _ticket_from_location,
     _CAPTCHA_CONFIG_RE,
     _jwt_expired,
 )
@@ -38,6 +45,35 @@ class DirectUCloudClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(UCloudLoginError):
             _extract_execution("<html></html>")
 
+    def test_extract_login_fields_preserves_dynamic_cas_fields(self) -> None:
+        fields = _extract_login_fields(
+            '<input value="abc" name="execution">'
+            '<input type="hidden" name="type" value="dynamic_type">'
+            '<input type="hidden" name="_eventId" value="proceed">'
+            '<input type="file" name="upload" value="ignored">'
+        )
+        self.assertEqual(
+            fields,
+            {"execution": "abc", "type": "dynamic_type", "_eventId": "proceed"},
+        )
+
+    def test_ticket_callback_must_match_https_ucloud_service(self) -> None:
+        self.assertEqual(
+            _ticket_from_location("https://ucloud.bupt.edu.cn/?ticket=ST-123"),
+            "ST-123",
+        )
+        self.assertEqual(
+            _ticket_from_location("https://evil.example/?ticket=ST-secret"), ""
+        )
+        self.assertEqual(
+            _ticket_from_location("http://ucloud.bupt.edu.cn/?ticket=ST-secret"), ""
+        )
+
+    def test_choose_identity_keeps_previous_role_when_available(self) -> None:
+        roles = [{"id": "first"}, {"id": "preferred"}]
+        self.assertEqual(_choose_identity(roles, "preferred"), "preferred")
+        self.assertEqual(_choose_identity(roles, "missing"), "first")
+
     def test_extract_login_error_removes_markup(self) -> None:
         html = (
             '<div class="alert" id="errorDiv">\n'
@@ -52,8 +88,8 @@ class DirectUCloudClientTests(unittest.IsolatedAsyncioTestCase):
             id: 'captcha'
         }
         </script>
-        self.assertIsNotNone(_CAPTCHA_CONFIG_RE.search(html))
         """
+        self.assertIsNotNone(_CAPTCHA_CONFIG_RE.search(html))
     async def test_undone_list_normalizes_course_info(self) -> None:
         client = DirectUCloudClient()
 
@@ -72,6 +108,39 @@ class DirectUCloudClientTests(unittest.IsolatedAsyncioTestCase):
             {"access_token": "token", "user_id": "user"}
         )
         self.assertEqual(data["undoneList"][0]["courseInfo"]["name"], "测试课程")
+
+    async def test_safe_get_retries_one_connection_failure(self) -> None:
+        client = DirectUCloudClient()
+        request = httpx.Request("GET", "https://auth.bupt.edu.cn/")
+        response = httpx.Response(200, request=request)
+        upstream = Mock()
+        upstream.get = AsyncMock(
+            side_effect=[httpx.ConnectError("offline", request=request), response]
+        )
+
+        result = await client._get_with_retry(
+            upstream, str(request.url), stage="cas-get"
+        )
+
+        self.assertIs(result, response)
+        self.assertEqual(upstream.get.await_count, 2)
+
+    async def test_safe_get_exposes_only_stage_after_retry_exhaustion(self) -> None:
+        client = DirectUCloudClient()
+        request = httpx.Request("GET", "https://auth.bupt.edu.cn/")
+        upstream = Mock()
+        upstream.get = AsyncMock(
+            side_effect=httpx.ConnectError("secret transport detail", request=request)
+        )
+
+        with self.assertRaises(UCloudUpstreamError) as raised:
+            await client._get_with_retry(
+                upstream, str(request.url), stage="cas-get"
+            )
+
+        self.assertEqual(raised.exception.stage, "cas-get")
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertEqual(upstream.get.await_count, 2)
 
 
 if __name__ == "__main__":

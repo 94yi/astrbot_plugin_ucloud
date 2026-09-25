@@ -69,6 +69,11 @@ class Main(star.Star):
     async def initialize(self) -> None:
         """Prepare local storage and start optional new-task polling."""
         self._store_path = StarTools.get_data_dir(self.name) / "accounts.json"
+        if self._store_path.exists():
+            try:
+                await asyncio.to_thread(self._store_path.chmod, 0o600)
+            except OSError as exc:
+                logger.error("Unable to secure UCloud account store: %s", exc)
         self._downloads = DownloadStore(
             self._store_path.parent / "downloads",
             max_bytes=max(1, min(512, int(self.config.get("download_max_mb", 200)))) * 1024**2,
@@ -133,14 +138,18 @@ class Main(star.Star):
         temporary = self._store_path.with_suffix(".tmp")
         content = json.dumps(accounts, ensure_ascii=False, indent=2)
         await asyncio.to_thread(temporary.write_text, content, encoding="utf-8")
+        await asyncio.to_thread(temporary.chmod, 0o600)
         await asyncio.to_thread(temporary.replace, self._store_path)
 
     async def _userinfo(self, account: dict[str, Any]) -> dict[str, Any]:
         """Return a current token set for a stored local account."""
         username = account["username"]
         async with self._token_locks.setdefault(username, asyncio.Lock()):
+            cached = self._tokens.get(username)
+            if cached is None and account.get("identity"):
+                cached = {"identity": str(account["identity"])}
             userinfo = await self._client.ensure_userinfo(
-                username, account["password"], self._tokens.get(username)
+                username, account["password"], cached
             )
             self._tokens[username] = userinfo
             return userinfo
@@ -390,6 +399,7 @@ class Main(star.Star):
             accounts[key] = {
                 "username": username,
                 "password": password,
+                "identity": str(userinfo.get("identity", "")),
                 "session": event.unified_msg_origin,
                 "push": True,
                 "known_task_ids": known_ids,

@@ -7,12 +7,14 @@ BUPT directly instead of using a public Worker.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import html as html_lib
 import json
 import mimetypes
 import re
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -50,6 +52,46 @@ class UCloudAPIError(UCloudError):
     """A Teaching Cloud endpoint returned an unsuccessful response."""
 
 
+class UCloudUpstreamError(UCloudError):
+    """A named upstream authentication stage failed without exposing secrets."""
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+
+
+class _LoginFormParser(HTMLParser):
+    """Collect ordinary named inputs from the CAS login form."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.fields: dict[str, str] = {}
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag.lower() != "input":
+            return
+        values = {key.lower(): value or "" for key, value in attrs}
+        name = values.get("name", "").strip()
+        input_type = values.get("type", "text").lower()
+        if (
+            name
+            and len(name) <= 100
+            and re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+            and input_type not in {"file", "submit", "button", "image"}
+        ):
+            self.fields[name] = values.get("value", "")
+
+
+def _extract_login_fields(html: str) -> dict[str, str]:
+    parser = _LoginFormParser()
+    parser.feed(html)
+    if not parser.fields.get("execution"):
+        raise UCloudLoginError("统一认证页面缺少 execution 字段")
+    return parser.fields
+
+
 def _jwt_expired(token: object, *, leeway_seconds: int = 60) -> bool:
     if not isinstance(token, str):
         return True
@@ -64,18 +106,25 @@ def _jwt_expired(token: object, *, leeway_seconds: int = 60) -> bool:
 
 
 def _extract_execution(html: str) -> str:
-    match = re.search(
-        r"""<input[^>]*name=["']execution["'][^>]*value=["']([^"']+)""",
-        html,
-        re.IGNORECASE,
-    ) or re.search(
-        r"""<input[^>]*value=["']([^"']+)["'][^>]*name=["']execution["']""",
-        html,
-        re.IGNORECASE,
-    )
-    if not match:
-        raise UCloudLoginError("统一认证页面缺少 execution 字段")
-    return match.group(1)
+    """Compatibility helper retained for callers and tests."""
+    return _extract_login_fields(html)["execution"]
+
+
+def _ticket_from_location(location: str) -> str:
+    """Accept tickets only from the configured HTTPS service callback."""
+    parsed = urlparse(location)
+    if parsed.scheme != "https" or parsed.hostname != "ucloud.bupt.edu.cn":
+        return ""
+    return parse_qs(parsed.query).get("ticket", [""])[0]
+
+
+def _choose_identity(
+    roles: list[dict[str, Any]], preferred_identity: str | None
+) -> str:
+    identities = [str(item.get("id", "")) for item in roles if item.get("id")]
+    if preferred_identity and preferred_identity in identities:
+        return preferred_identity
+    return identities[0] if identities else ""
 
 
 def _extract_login_error(html: str) -> str:
@@ -95,17 +144,52 @@ class DirectUCloudClient:
     def __init__(self, timeout_seconds: float = 15.0) -> None:
         self.timeout = httpx.Timeout(timeout_seconds)
 
+    async def _get_with_retry(
+        self, client: httpx.AsyncClient, url: str, *, stage: str
+    ) -> httpx.Response:
+        """Retry one idempotent GET once, never credential or ticket POSTs."""
+        for attempt in range(2):
+            try:
+                return await client.get(url)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if attempt:
+                    raise UCloudUpstreamError(
+                        stage, f"{stage} 阶段无法连接上游服务"
+                    ) from exc
+                await asyncio.sleep(0.2)
+        raise AssertionError("unreachable")
+
     async def _json_request(
         self,
         method: str,
         url: str,
         *,
         headers: dict[str, str] | None = None,
+        stage: str = "api",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.request(method, url, headers=headers, **kwargs)
-        response.raise_for_status()
+        attempts = 2 if method.upper() == "GET" else 1
+        async with httpx.AsyncClient(
+            timeout=self.timeout, trust_env=False
+        ) as client:
+            for attempt in range(attempts):
+                try:
+                    response = await client.request(
+                        method, url, headers=headers, **kwargs
+                    )
+                    break
+                except httpx.TransportError as exc:
+                    if attempt + 1 == attempts:
+                        raise UCloudUpstreamError(
+                            stage, f"{stage} 阶段无法连接上游服务"
+                        ) from exc
+                    await asyncio.sleep(0.2)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise UCloudUpstreamError(
+                stage, f"{stage} 阶段返回 HTTP {response.status_code}"
+            ) from exc
         try:
             payload = response.json()
         except json.JSONDecodeError as exc:
@@ -116,7 +200,13 @@ class DirectUCloudClient:
             raise UCloudAPIError(str(payload.get("msg") or "教学云请求失败"))
         return payload
 
-    async def login(self, username: str, password: str) -> dict[str, Any]:
+    async def login(
+        self,
+        username: str,
+        password: str,
+        *,
+        preferred_identity: str | None = None,
+    ) -> dict[str, Any]:
         headers = {
             "user-agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -127,36 +217,49 @@ class DirectUCloudClient:
             timeout=self.timeout,
             follow_redirects=False,
             headers=headers,
+            trust_env=False,
         ) as client:
-            page = await client.get(CAS_LOGIN_URL)
-            page.raise_for_status()
+            page = await self._get_with_retry(client, CAS_LOGIN_URL, stage="cas-get")
+            try:
+                page.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise UCloudUpstreamError(
+                    "cas-get", "统一认证登录页暂时不可用"
+                ) from exc
             html = page.text
-            execution = _extract_execution(html)
+            form = _extract_login_fields(html)
             if _CAPTCHA_CONFIG_RE.search(html):
                 raise UCloudCaptchaRequired(
                     "统一认证要求验证码；为避免外部 OCR 泄露会话，请稍后重试"
                 )
-            response = await client.post(
-                CAS_LOGIN_URL,
-                data={
+            form.update(
+                {
                     "username": username,
                     "password": password,
-                    "submit": "登录",
-                    "type": "username_password",
-                    "execution": execution,
-                    "_eventId": "submit",
-                },
-                headers={"referer": CAS_LOGIN_URL},
+                    "submit": "LOGIN",
+                    "type": form.get("type") or "username_password",
+                    "_eventId": form.get("_eventId") or "submit",
+                }
             )
-            if response.status_code != 302:
+            try:
+                response = await client.post(
+                    CAS_LOGIN_URL,
+                    data=form,
+                    headers={"referer": CAS_LOGIN_URL},
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                raise UCloudUpstreamError(
+                    "cas-post", "提交统一认证凭据时无法连接上游服务"
+                ) from exc
+            if response.status_code not in {302, 303}:
                 message = _extract_login_error(response.text)
                 if message == "Invalid credentials.":
                     message = "学号或统一认证密码错误"
                 raise UCloudLoginError(message)
             location = response.headers.get("location", "")
-            ticket = parse_qs(urlparse(location).query).get("ticket", [""])[0]
+            ticket = _ticket_from_location(location)
             if not ticket:
-                raise UCloudLoginError("统一认证没有返回 service ticket")
+                raise UCloudLoginError("统一认证返回了无效的教学云跳转地址")
 
         token_payload = await self._json_request(
             "POST",
@@ -167,13 +270,17 @@ class DirectUCloudClient:
                 "content-type": "application/x-www-form-urlencoded",
             },
             content=urlencode({"ticket": ticket, "grant_type": "third"}),
+            stage="oauth-ticket",
         )
         roles = await self.get_roles(str(token_payload.get("refresh_token", "")))
         if not roles:
             raise UCloudLoginError("当前账号没有可用的教学云角色")
-        refreshed = await self.refresh(token_payload, identity=str(roles[0]["id"]))
+        selected_identity = _choose_identity(roles, preferred_identity)
+        if not selected_identity:
+            raise UCloudLoginError("当前账号的教学云角色缺少身份标识")
+        refreshed = await self.refresh(token_payload, identity=selected_identity)
         refreshed["roles"] = roles
-        refreshed["identity"] = str(roles[0]["id"])
+        refreshed["identity"] = selected_identity
         return refreshed
 
     async def get_roles(self, token: str) -> list[dict[str, Any]]:
@@ -181,6 +288,7 @@ class DirectUCloudClient:
             "GET",
             f"{API_BASE_URL}/ykt-basics/userroledomaindept/listByUserId",
             headers={**DEFAULT_HEADERS, "blade-auth": token},
+            stage="role-list",
         )
         roles = payload.get("data", [])
         if not isinstance(roles, list):
@@ -208,6 +316,7 @@ class DirectUCloudClient:
             f"{API_BASE_URL}/ykt-basics/oauth/token",
             headers={"authorization": PORTAL_AUTH},
             files=fields,
+            stage="token-refresh",
         )
         if selected_identity:
             payload["identity"] = selected_identity
@@ -228,7 +337,10 @@ class DirectUCloudClient:
                 return await self.refresh(cached)
             except (httpx.HTTPError, UCloudError):
                 pass
-        return await self.login(username, password)
+        preferred_identity = str(cached.get("identity", "")) if cached else None
+        return await self.login(
+            username, password, preferred_identity=preferred_identity or None
+        )
 
     @staticmethod
     def _api_headers(userinfo: dict[str, Any]) -> dict[str, str]:
