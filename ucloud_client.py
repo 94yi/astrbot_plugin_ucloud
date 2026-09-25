@@ -67,9 +67,7 @@ class _LoginFormParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.fields: dict[str, str] = {}
 
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() != "input":
             return
         values = {key.lower(): value or "" for key, value in attrs}
@@ -151,7 +149,7 @@ class DirectUCloudClient:
         for attempt in range(2):
             try:
                 return await client.get(url)
-            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            except httpx.TransportError as exc:
                 if attempt:
                     raise UCloudUpstreamError(
                         stage, f"{stage} 阶段无法连接上游服务"
@@ -169,9 +167,7 @@ class DirectUCloudClient:
         **kwargs: Any,
     ) -> dict[str, Any]:
         attempts = 2 if method.upper() == "GET" else 1
-        async with httpx.AsyncClient(
-            timeout=self.timeout, trust_env=False
-        ) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
             for attempt in range(attempts):
                 try:
                     response = await client.request(
@@ -187,6 +183,12 @@ class DirectUCloudClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            if stage in {"oauth-ticket", "token-refresh"} and response.status_code in {
+                400,
+                401,
+                403,
+            }:
+                raise UCloudLoginError("教学云登录凭据已失效") from exc
             raise UCloudUpstreamError(
                 stage, f"{stage} 阶段返回 HTTP {response.status_code}"
             ) from exc
@@ -236,7 +238,7 @@ class DirectUCloudClient:
                 {
                     "username": username,
                     "password": password,
-                    "submit": "LOGIN",
+                    "submit": "登录",
                     "type": form.get("type") or "username_password",
                     "_eventId": form.get("_eventId") or "submit",
                 }
@@ -247,7 +249,7 @@ class DirectUCloudClient:
                     data=form,
                     headers={"referer": CAS_LOGIN_URL},
                 )
-            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            except httpx.TransportError as exc:
                 raise UCloudUpstreamError(
                     "cas-post", "提交统一认证凭据时无法连接上游服务"
                 ) from exc
@@ -272,7 +274,10 @@ class DirectUCloudClient:
             content=urlencode({"ticket": ticket, "grant_type": "third"}),
             stage="oauth-ticket",
         )
-        roles = await self.get_roles(str(token_payload.get("refresh_token", "")))
+        refresh_token = str(token_payload.get("refresh_token", ""))
+        if not refresh_token:
+            raise UCloudLoginError("教学云登录响应缺少 refresh token")
+        roles = await self.get_roles(refresh_token)
         if not roles:
             raise UCloudLoginError("当前账号没有可用的教学云角色")
         selected_identity = _choose_identity(roles, preferred_identity)
@@ -318,6 +323,10 @@ class DirectUCloudClient:
             files=fields,
             stage="token-refresh",
         )
+        if not payload.get("access_token"):
+            raise UCloudLoginError("教学云刷新响应缺少 access token")
+        if not payload.get("refresh_token"):
+            payload["refresh_token"] = refresh_token
         if selected_identity:
             payload["identity"] = selected_identity
         if isinstance(userinfo.get("roles"), list):
@@ -335,7 +344,7 @@ class DirectUCloudClient:
         if cached and not _jwt_expired(cached.get("refresh_token")):
             try:
                 return await self.refresh(cached)
-            except (httpx.HTTPError, UCloudError):
+            except UCloudLoginError:
                 pass
         preferred_identity = str(cached.get("identity", "")) if cached else None
         return await self.login(
@@ -415,10 +424,15 @@ class DirectUCloudClient:
         result = []
         for page in range(1, 21):
             payload = await self._json_request(
-                "GET", API_BASE_URL + "/ykt-site/site/list/student/current",
+                "GET",
+                API_BASE_URL + "/ykt-site/site/list/student/current",
                 headers=self._api_headers(userinfo),
-                params={"userId": userinfo.get("user_id", ""), "siteRoleCode": 2,
-                        "current": page, "size": 100},
+                params={
+                    "userId": userinfo.get("user_id", ""),
+                    "siteRoleCode": 2,
+                    "current": page,
+                    "size": 100,
+                },
             )
             data = payload.get("data")
             if not isinstance(data, dict) or not isinstance(data.get("records"), list):
@@ -431,7 +445,8 @@ class DirectUCloudClient:
     async def get_course_resources(self, userinfo, site_id):
         """Student visibility only; never query the teacher/owner resource tree."""
         payload = await self._json_request(
-            "POST", API_BASE_URL + "/ykt-site/site-resource/tree/student",
+            "POST",
+            API_BASE_URL + "/ykt-site/site-resource/tree/student",
             headers=self._api_headers(userinfo),
             params={"siteId": site_id, "userId": userinfo.get("user_id", "")},
         )
@@ -439,6 +454,7 @@ class DirectUCloudClient:
         if not isinstance(tree, list):
             raise UCloudAPIError("课程资源树格式异常")
         result, visited = {}, 0
+
         def visit(nodes, depth=0):
             nonlocal visited
             if depth > 20 or not isinstance(nodes, list):
@@ -448,23 +464,32 @@ class DirectUCloudClient:
                 if visited > 5000 or not isinstance(node, dict):
                     raise UCloudAPIError("课程资源树超限或格式异常")
                 for attachment in node.get("attachmentVOs") or []:
-                    resource = attachment.get("resource") if isinstance(attachment, dict) else None
+                    resource = (
+                        attachment.get("resource")
+                        if isinstance(attachment, dict)
+                        else None
+                    )
                     if isinstance(resource, dict) and resource.get("id"):
                         result[str(resource["id"])] = resource
                 visit(node.get("children") or [], depth + 1)
+
         visit(tree)
         return list(result.values())
 
     async def get_resource_metadata(self, userinfo, resource_ids):
         ids = list(dict.fromkeys(str(value) for value in resource_ids))
-        if len(ids) > 2000 or any(not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value) for value in ids):
+        if len(ids) > 2000 or any(
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value) for value in ids
+        ):
             raise UCloudAPIError("附件标识无效或数量超限")
         result = {}
         for offset in range(0, len(ids), 50):
-            batch = ids[offset:offset + 50]
+            batch = ids[offset : offset + 50]
             payload = await self._json_request(
-                "GET", API_BASE_URL + "/blade-source/resource/list/byId",
-                headers=self._api_headers(userinfo), params={"resourceIds": ",".join(batch)},
+                "GET",
+                API_BASE_URL + "/blade-source/resource/list/byId",
+                headers=self._api_headers(userinfo),
+                params={"resourceIds": ",".join(batch)},
             )
             data = payload.get("data")
             if not isinstance(data, list):
@@ -479,8 +504,10 @@ class DirectUCloudClient:
 
     async def get_resource_url(self, userinfo, resource_id):
         payload = await self._json_request(
-            "GET", API_BASE_URL + "/blade-source/resource/filePath",
-            headers=self._api_headers(userinfo), params={"resourceId": resource_id},
+            "GET",
+            API_BASE_URL + "/blade-source/resource/filePath",
+            headers=self._api_headers(userinfo),
+            params={"resourceId": resource_id},
         )
         if not isinstance(payload.get("data"), str) or not payload["data"]:
             raise UCloudAPIError("教学云未返回原文件下载地址")

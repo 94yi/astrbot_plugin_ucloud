@@ -21,9 +21,11 @@ from astrbot_plugin_ucloud.ucloud_client import (
 
 
 def _token(expiry: float) -> str:
-    payload = base64.urlsafe_b64encode(
-        json.dumps({"exp": expiry}).encode("utf-8")
-    ).decode("ascii").rstrip("=")
+    payload = (
+        base64.urlsafe_b64encode(json.dumps({"exp": expiry}).encode("utf-8"))
+        .decode("ascii")
+        .rstrip("=")
+    )
     return f"header.{payload}.signature"
 
 
@@ -77,7 +79,7 @@ class DirectUCloudClientTests(unittest.IsolatedAsyncioTestCase):
     def test_extract_login_error_removes_markup(self) -> None:
         html = (
             '<div class="alert" id="errorDiv">\n'
-            '  <span>提示</span>\n<p>Bad <b>password</b> &amp; retry</p>\n</div>'
+            "  <span>提示</span>\n<p>Bad <b>password</b> &amp; retry</p>\n</div>"
         )
         self.assertEqual(_extract_login_error(html), "Bad password & retry")
 
@@ -90,6 +92,7 @@ class DirectUCloudClientTests(unittest.IsolatedAsyncioTestCase):
         </script>
         """
         self.assertIsNotNone(_CAPTCHA_CONFIG_RE.search(html))
+
     async def test_undone_list_normalizes_course_info(self) -> None:
         client = DirectUCloudClient()
 
@@ -134,13 +137,71 @@ class DirectUCloudClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(UCloudUpstreamError) as raised:
-            await client._get_with_retry(
-                upstream, str(request.url), stage="cas-get"
-            )
+            await client._get_with_retry(upstream, str(request.url), stage="cas-get")
 
         self.assertEqual(raised.exception.stage, "cas-get")
         self.assertNotIn("secret", str(raised.exception))
         self.assertEqual(upstream.get.await_count, 2)
+
+    async def test_safe_get_retries_other_transport_failures(self) -> None:
+        client = DirectUCloudClient()
+        request = httpx.Request("GET", "https://auth.bupt.edu.cn/")
+        response = httpx.Response(200, request=request)
+        upstream = Mock()
+        upstream.get = AsyncMock(
+            side_effect=[httpx.ReadTimeout("slow", request=request), response]
+        )
+
+        result = await client._get_with_retry(
+            upstream, str(request.url), stage="cas-get"
+        )
+
+        self.assertIs(result, response)
+        self.assertEqual(upstream.get.await_count, 2)
+
+    async def test_refresh_outage_does_not_replay_credentials(self) -> None:
+        client = DirectUCloudClient()
+        client.refresh = AsyncMock(
+            side_effect=UCloudUpstreamError("token-refresh", "暂时不可用")
+        )
+        client.login = AsyncMock()
+        cached = {
+            "access_token": _token(time.time() - 60),
+            "refresh_token": _token(time.time() + 3600),
+        }
+
+        with self.assertRaises(UCloudUpstreamError):
+            await client.ensure_userinfo("student", "secret", cached)
+
+        client.login.assert_not_awaited()
+
+    async def test_rejected_refresh_reauthenticates_once(self) -> None:
+        client = DirectUCloudClient()
+        client.refresh = AsyncMock(side_effect=UCloudLoginError("expired"))
+        client.login = AsyncMock(return_value={"access_token": "new"})
+        cached = {
+            "access_token": _token(time.time() - 60),
+            "refresh_token": _token(time.time() + 3600),
+            "identity": "role-2",
+        }
+
+        result = await client.ensure_userinfo("student", "secret", cached)
+
+        self.assertEqual(result, {"access_token": "new"})
+        client.login.assert_awaited_once_with(
+            "student", "secret", preferred_identity="role-2"
+        )
+
+    async def test_refresh_preserves_unrotated_refresh_token(self) -> None:
+        client = DirectUCloudClient()
+        client._json_request = AsyncMock(return_value={"access_token": "new-access"})
+
+        result = await client.refresh(
+            {"refresh_token": "existing-refresh", "identity": "role-1"}
+        )
+
+        self.assertEqual(result["refresh_token"], "existing-refresh")
+        self.assertEqual(result["identity"], "role-1")
 
 
 if __name__ == "__main__":
