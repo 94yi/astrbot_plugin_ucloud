@@ -431,6 +431,34 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
             ("100200", ""),
         )
 
+    async def test_non_assignment_detail_does_not_call_homework_api(self) -> None:
+        plugin = object.__new__(Main)
+        plugin._store_lock = asyncio.Lock()
+        plugin._task_lists = {}
+        plugin._remember_task_list(
+            "session-1",
+            [
+                {
+                    "activityId": "unit-1",
+                    "activityName": "Unit 1",
+                    "assignmentType": -1,
+                    "type": 4,
+                    "siteName": "云计算技术",
+                    "endTime": "明天",
+                }
+            ],
+        )
+        plugin._read_accounts = AsyncMock(
+            return_value={"session-1": {"username": "student"}}
+        )
+        plugin._fetch = AsyncMock()
+
+        replies = await _collect(plugin.detail(_Event(), "1"))
+
+        self.assertIn("登录状态正常", replies[0])
+        self.assertIn("学习活动", replies[0])
+        plugin._fetch.assert_not_awaited()
+
     async def test_submit_picker_maps_reply_number_to_snapshot(self) -> None:
         selected: list[str] = []
         sent: list[tuple[str, Any]] = []

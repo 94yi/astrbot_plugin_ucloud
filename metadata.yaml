@@ -3,5 +3,5 @@ display_name: BUPT UCloud Tasks
 desc: 自然语言查询北邮教学云课程、课件与作业附件，默认直链下载到本机不缓存服务器；可选QQ文件交付、完整性校验与去重。
 short_desc: Direct BUPT Teaching Cloud tasks without a public Worker dependency.
 author: perrin
-version: 0.6.3
+version: 0.6.4
 astrbot_version: ">=4.28,<5"

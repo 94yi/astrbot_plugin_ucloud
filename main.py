@@ -328,9 +328,15 @@ class Main(star.Star):
         title = str(task.get("activityName") or "未命名待办")
         deadline = str(task.get("endTime") or "未提供")
         activity_id = str(task.get("activityId") or "-")
+        kind = "学习活动" if not self._is_assignment_task(task) else "作业"
         return (
-            f"• {title}\n  课程：{course_name}｜截止：{deadline}\n  ID：{activity_id}"
+            f"• {title}\n  类型：{kind}｜课程：{course_name}｜截止：{deadline}\n  ID：{activity_id}"
         )
+
+    @staticmethod
+    def _is_assignment_task(task: dict[str, Any]) -> bool:
+        """Distinguish homework from chapter/unit learning activities."""
+        return str(task.get("assignmentType", "")) != "-1"
 
     def _remember_task_list(self, key: str, items: list[dict[str, Any]]) -> None:
         """Cache the exact numbered list shown to one session."""
@@ -344,6 +350,8 @@ class Main(star.Star):
                     "courseInfo": item.get("courseInfo") if isinstance(item.get("courseInfo"), dict) else {},
                     "siteName": str(item.get("siteName") or ""),
                     "endTime": str(item.get("endTime") or ""),
+                    "assignmentType": item.get("assignmentType"),
+                    "type": item.get("type"),
                 }
                 for item in items
                 if item.get("activityId") is not None
@@ -373,6 +381,17 @@ class Main(star.Star):
         if int(value) <= 20:
             return "", "作业序号列表不存在或已过期，请先使用 /ucloud_tasks；直接提交请使用 id:作业ID。"
         return value, ""
+
+    def _task_snapshot_item(
+        self, key: str, activity_id: str
+    ) -> dict[str, Any] | None:
+        snapshot = getattr(self, "_task_lists", {}).get(key)
+        if not snapshot or float(snapshot.get("expires_at", 0)) <= time.monotonic():
+            return None
+        for item in snapshot.get("items", []):
+            if str(item.get("activityId")) == str(activity_id):
+                return item
+        return None
 
     @filter.command("ucloud_login")
     async def login(
@@ -464,8 +483,8 @@ class Main(star.Star):
         if len(items) > len(shown):
             text += f"\n\n…其余 {len(items) - len(shown)} 项未显示。"
         text += (
-            "\n\n10 分钟内可使用 /ucloud_detail 序号 或 "
-            "/ucloud_submit 序号 [正文]；直接指定请使用 id:作业ID。"
+            "\n\n10 分钟内可使用 /ucloud_detail 序号 查看；"
+            "只有标记为作业的项目才能使用 /ucloud_submit 序号 [正文]"
         )
         yield event.plain_result(text)
 
@@ -487,6 +506,17 @@ class Main(star.Star):
         if reference_error:
             yield event.plain_result(reference_error)
             return
+        snapshot_item = self._task_snapshot_item(
+            event.unified_msg_origin, activity_id
+        )
+        if snapshot_item and not self._is_assignment_task(snapshot_item):
+            course = str(snapshot_item.get("siteName") or "未知课程")
+            deadline = str(snapshot_item.get("endTime") or "未提供")
+            yield event.plain_result(
+                "登录状态正常，这项待办属于课程学习活动，不是作业，"
+                f"教学云没有对应的作业详情接口\n课程：{course}｜截止：{deadline}"
+            )
+            return
         async with self._store_lock:
             account = (await self._read_accounts()).get(event.unified_msg_origin)
         if not account:
@@ -496,11 +526,17 @@ class Main(star.Star):
             return
         try:
             data = await self._fetch(account, f"/homework?id={activity_id}")
+        except UCloudLoginError as exc:
+            logger.warning("UCloud detail authentication rejected: %s", exc)
+            yield event.plain_result("教学云登录状态已失效，请重新登录")
+            return
         except (httpx.HTTPError, UCloudError, ValueError) as exc:
             logger.warning(
                 "Direct UCloud detail request failed: %s: %s", type(exc).__name__, exc
             )
-            yield event.plain_result("暂时无法直连北邮教学云，请稍后重试。")
+            yield event.plain_result(
+                "账号仍已保存，但教学云作业详情接口暂时异常，请稍后重试"
+            )
             return
         if not isinstance(data, dict):
             yield event.plain_result("教学云返回了无法识别的作业详情。")
@@ -787,6 +823,11 @@ class Main(star.Star):
                 reference, error = self._resolve_task_reference(event.unified_msg_origin, reference)
                 if error:
                     raise UCloudAPIError(error)
+                snapshot_item = self._task_snapshot_item(
+                    event.unified_msg_origin, reference
+                )
+                if snapshot_item and not self._is_assignment_task(snapshot_item):
+                    raise UCloudAPIError("这项待办是学习活动，不是作业，没有作业附件接口")
             elif not reference[7:].isdigit():
                 raise UCloudAPIError("课程 ID 应为数字；先使用 /ucloud_courses 查询")
             userinfo = await self._userinfo(account)
@@ -1009,6 +1050,12 @@ class Main(star.Star):
             if reference_error:
                 yield event.plain_result(reference_error)
                 return
+            snapshot_item = self._task_snapshot_item(
+                event.unified_msg_origin, activity_id
+            )
+            if snapshot_item and not self._is_assignment_task(snapshot_item):
+                yield event.plain_result("这项待办是学习活动，不是可提交的作业")
+                return
             supplied_content = args[1] if len(args) > 1 else None
             result = await self._prepare_submission_draft(
                 event, activity_id, supplied_content
@@ -1043,7 +1090,9 @@ class Main(star.Star):
         items = [
             item
             for item in data.get("undoneList", [])
-            if isinstance(item, dict) and item.get("activityId") is not None
+            if isinstance(item, dict)
+            and item.get("activityId") is not None
+            and self._is_assignment_task(item)
         ]
         if not items:
             yield event.plain_result("当前没有可选择的未完成作业。")

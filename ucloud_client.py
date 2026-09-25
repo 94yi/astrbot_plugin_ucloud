@@ -34,6 +34,7 @@ _CAPTCHA_CONFIG_RE = re.compile(
     r"config\.captcha\s*=\s*\{[^}]*\bid\s*:\s*['\"]",
     re.IGNORECASE | re.DOTALL,
 )
+_TRANSIENT_READ_STATUSES = {429, 500, 502, 503, 504}
 
 
 class UCloudError(Exception):
@@ -125,6 +126,11 @@ def _choose_identity(
     return identities[0] if identities else ""
 
 
+def _retryable_response(method: str, status_code: int) -> bool:
+    """Retry only read requests rejected with a known transient status."""
+    return method.upper() == "GET" and status_code in _TRANSIENT_READ_STATUSES
+
+
 def _extract_login_error(html: str) -> str:
     match = re.search(
         r"""<div[^>]*id=["']errorDiv["'][^>]*>[\s\S]*?<p>(.*?)</p>""",
@@ -166,20 +172,24 @@ class DirectUCloudClient:
         stage: str = "api",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        attempts = 2 if method.upper() == "GET" else 1
+        attempts = 3 if method.upper() == "GET" else 1
         async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
             for attempt in range(attempts):
                 try:
                     response = await client.request(
                         method, url, headers=headers, **kwargs
                     )
-                    break
                 except httpx.TransportError as exc:
                     if attempt + 1 == attempts:
                         raise UCloudUpstreamError(
                             stage, f"{stage} 阶段无法连接上游服务"
                         ) from exc
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.25 * (attempt + 1))
+                    continue
+                if _retryable_response(method, response.status_code) and attempt + 1 < attempts:
+                    await asyncio.sleep(0.25 * (attempt + 1))
+                    continue
+                break
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -367,6 +377,7 @@ class DirectUCloudClient:
                 "identity": "JS005:1528800428957896705",
             },
             params={"userId": str(userinfo.get("user_id", ""))},
+            stage="task-list",
         )
         data = payload.get("data", {})
         if not isinstance(data, dict):
@@ -396,6 +407,7 @@ class DirectUCloudClient:
                 "identity": "JS005:1528800428957896705",
             },
             params={"assignmentId": activity_id},
+            stage="assignment-detail",
         )
         data = payload.get("data", {})
         if not isinstance(data, dict):

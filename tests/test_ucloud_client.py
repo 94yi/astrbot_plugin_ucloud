@@ -15,6 +15,7 @@ from astrbot_plugin_ucloud.ucloud_client import (
     _extract_login_fields,
     _extract_login_error,
     _ticket_from_location,
+    _retryable_response,
     _CAPTCHA_CONFIG_RE,
     _jwt_expired,
 )
@@ -75,6 +76,12 @@ class DirectUCloudClientTests(unittest.IsolatedAsyncioTestCase):
         roles = [{"id": "first"}, {"id": "preferred"}]
         self.assertEqual(_choose_identity(roles, "preferred"), "preferred")
         self.assertEqual(_choose_identity(roles, "missing"), "first")
+
+    def test_only_transient_read_responses_are_retryable(self) -> None:
+        self.assertTrue(_retryable_response("GET", 500))
+        self.assertTrue(_retryable_response("GET", 429))
+        self.assertFalse(_retryable_response("POST", 500))
+        self.assertFalse(_retryable_response("GET", 401))
 
     def test_extract_login_error_removes_markup(self) -> None:
         html = (
