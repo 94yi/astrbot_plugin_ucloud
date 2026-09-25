@@ -152,7 +152,26 @@ class Main(star.Star):
                 username, account["password"], cached
             )
             self._tokens[username] = userinfo
+            identity = str(userinfo.get("identity", ""))
+            if identity and identity != str(account.get("identity", "")):
+                await self._persist_account_identity(account, identity)
             return userinfo
+
+    async def _persist_account_identity(
+        self, account: dict[str, Any], identity: str
+    ) -> None:
+        """Migrate an existing account to stable role selection without secrets."""
+        session = str(account.get("session", ""))
+        username = str(account.get("username", ""))
+        if not session or not username:
+            return
+        async with self._store_lock:
+            accounts = await self._read_accounts()
+            stored = accounts.get(session)
+            if not stored or stored.get("username") != username:
+                return
+            stored["identity"] = identity
+            await self._write_accounts(accounts)
 
     async def _fetch(self, account: dict[str, Any], path: str) -> Any:
         """Request one authenticated UCloud API resource.

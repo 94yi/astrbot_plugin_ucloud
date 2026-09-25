@@ -315,6 +315,40 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [{"identity": "role-2"}])
         self.assertEqual(result["identity"], "role-2")
 
+    async def test_userinfo_migrates_role_for_existing_account(self) -> None:
+        class _Client:
+            async def ensure_userinfo(
+                self, _username: str, _password: str, _cached: dict[str, Any] | None
+            ) -> dict[str, Any]:
+                return {"access_token": "new-token", "identity": "role-2"}
+
+        stored = {
+            "session-1": {
+                "username": "student",
+                "password": "password",
+                "session": "session-1",
+            }
+        }
+        plugin = object.__new__(Main)
+        plugin._client = _Client()
+        plugin._tokens = {}
+        plugin._token_locks = {}
+        plugin._store_lock = asyncio.Lock()
+
+        async def read_accounts() -> dict[str, dict[str, Any]]:
+            return {key: dict(value) for key, value in stored.items()}
+
+        async def write_accounts(accounts: dict[str, dict[str, Any]]) -> None:
+            stored.clear()
+            stored.update(accounts)
+
+        plugin._read_accounts = read_accounts
+        plugin._write_accounts = write_accounts
+
+        await plugin._userinfo(dict(stored["session-1"]))
+
+        self.assertEqual(stored["session-1"]["identity"], "role-2")
+
     async def test_logout_clears_private_in_memory_state(self) -> None:
         stored = {
             "session-1": {
