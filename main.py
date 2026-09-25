@@ -146,31 +146,43 @@ class Main(star.Star):
         username = account["username"]
         async with self._token_locks.setdefault(username, asyncio.Lock()):
             cached = self._tokens.get(username)
-            if cached is None and account.get("identity"):
-                cached = {"identity": str(account["identity"])}
+            if cached is None:
+                restored = {}
+                if account.get("refresh_token"):
+                    restored["refresh_token"] = str(account["refresh_token"])
+                if account.get("identity"):
+                    restored["identity"] = str(account["identity"])
+                cached = restored or None
             userinfo = await self._client.ensure_userinfo(
                 username, account["password"], cached
             )
             self._tokens[username] = userinfo
-            identity = str(userinfo.get("identity", ""))
-            if identity and identity != str(account.get("identity", "")):
-                await self._persist_account_identity(account, identity)
+            await self._persist_account_auth_state(account, userinfo)
             return userinfo
 
-    async def _persist_account_identity(
-        self, account: dict[str, Any], identity: str
+    async def _persist_account_auth_state(
+        self, account: dict[str, Any], userinfo: dict[str, Any]
     ) -> None:
-        """Migrate an existing account to stable role selection without secrets."""
+        """Persist the rotating refresh token and stable role, never access tokens."""
         session = str(account.get("session", ""))
         username = str(account.get("username", ""))
         if not session or not username:
+            return
+        updates = {}
+        identity = str(userinfo.get("identity", ""))
+        refresh_token = str(userinfo.get("refresh_token", ""))
+        if identity and identity != str(account.get("identity", "")):
+            updates["identity"] = identity
+        if refresh_token and refresh_token != str(account.get("refresh_token", "")):
+            updates["refresh_token"] = refresh_token
+        if not updates:
             return
         async with self._store_lock:
             accounts = await self._read_accounts()
             stored = accounts.get(session)
             if not stored or stored.get("username") != username:
                 return
-            stored["identity"] = identity
+            stored.update(updates)
             await self._write_accounts(accounts)
 
     async def _fetch(self, account: dict[str, Any], path: str) -> Any:
@@ -434,7 +446,7 @@ class Main(star.Star):
         key = event.unified_msg_origin
         async with self._store_lock:
             accounts = await self._read_accounts()
-            accounts[key] = {
+            account_record = {
                 "username": username,
                 "password": password,
                 "identity": str(userinfo.get("identity", "")),
@@ -442,6 +454,10 @@ class Main(star.Star):
                 "push": True,
                 "known_task_ids": known_ids,
             }
+            refresh_token = str(userinfo.get("refresh_token", ""))
+            if refresh_token:
+                account_record["refresh_token"] = refresh_token
+            accounts[key] = account_record
             await self._write_accounts(accounts)
         yield event.plain_result(
             f"登录成功，当前有 {len(known_ids)} 项未完成待办；新待办提醒已开启。"

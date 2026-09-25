@@ -349,6 +349,54 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(stored["session-1"]["identity"], "role-2")
 
+    async def test_userinfo_restores_and_rotates_saved_refresh_token(self) -> None:
+        calls: list[dict[str, Any] | None] = []
+
+        class _Client:
+            async def ensure_userinfo(
+                self, _username: str, _password: str, cached: dict[str, Any] | None
+            ) -> dict[str, Any]:
+                calls.append(cached)
+                return {
+                    "access_token": "memory-only",
+                    "refresh_token": "rotated-refresh",
+                    "identity": "role-2",
+                }
+
+        stored = {
+            "session-1": {
+                "username": "student",
+                "password": "password",
+                "refresh_token": "saved-refresh",
+                "identity": "role-2",
+                "session": "session-1",
+            }
+        }
+        plugin = object.__new__(Main)
+        plugin._client = _Client()
+        plugin._tokens = {}
+        plugin._token_locks = {}
+        plugin._store_lock = asyncio.Lock()
+
+        async def read_accounts() -> dict[str, dict[str, Any]]:
+            return {key: dict(value) for key, value in stored.items()}
+
+        async def write_accounts(accounts: dict[str, dict[str, Any]]) -> None:
+            stored.clear()
+            stored.update(accounts)
+
+        plugin._read_accounts = read_accounts
+        plugin._write_accounts = write_accounts
+
+        await plugin._userinfo(dict(stored["session-1"]))
+
+        self.assertEqual(
+            calls,
+            [{"refresh_token": "saved-refresh", "identity": "role-2"}],
+        )
+        self.assertEqual(stored["session-1"]["refresh_token"], "rotated-refresh")
+        self.assertNotIn("access_token", stored["session-1"])
+
     async def test_logout_clears_private_in_memory_state(self) -> None:
         stored = {
             "session-1": {

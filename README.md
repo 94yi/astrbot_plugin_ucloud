@@ -94,9 +94,13 @@ Restrict filesystem access to the AstrBot host, and run `/ucloud_logout` when
 you no longer want the credentials retained. Passwords are never written to
 plugin logs or the WebUI configuration.
 
-The plugin caches access tokens in memory and refreshes them directly with the
-BUPT API. If CAS requests a captcha, it stops with a clear message instead of
-sending the session cookie or captcha to an external OCR service.
+The plugin keeps access tokens in memory only. It stores the rotating refresh
+token in the same owner-only `0600` account file as the required CAS fallback
+password, allowing restarts to resume through token refresh instead of repeating
+a password login. If the refresh token is explicitly rejected, CAS is attempted
+once; transient refresh outages never replay credentials. If CAS requests a
+captcha, the plugin stops instead of sending the session cookie or captcha to an
+external OCR service.
 
 The login client reads CAS hidden fields from the current form instead of
 assuming fixed values, validates that the service ticket returns only through
