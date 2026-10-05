@@ -1,9 +1,46 @@
 {
-  "api_base_url": {
-    "type": "text",
-    "description": "UCloud API base URL",
-    "hint": "Defaults to the public BUPT Teaching Cloud API used by YouXam/ucloud.",
-    "default": "https://ucloud.youxam.workers.dev"
+  "delete_after_qq_delivery": {
+    "type": "bool",
+    "description": "QQ发送确认成功后清理临时下载",
+    "hint": "默认开启。成功回执持久化后，校验内容并删除对应缓存和下载索引，保留发送记录。失败或回执不明保留文件。",
+    "default": true
+  },
+  "proxy_enabled": {
+    "type": "bool",
+    "description": "使用服务器流式转发下载（不落盘）",
+    "hint": "默认开启，替代direct模式的校园网直链；使用管理页登录鉴权和1小时临时链接，最多2路并发。关闭后浏览器直接连接教学云。",
+    "default": true
+  },
+  "proxy_public_base_url": {
+    "type": "string",
+    "description": "电脑可访问的AstrBot管理页根地址",
+    "hint": "填写https://你的域名或http://服务器地址:6185，不含/#/等页面路径。浏览器先登录此管理页再打开下载链接。反向代理须关闭响应缓存/磁盘缓冲。",
+    "default": ""
+  },
+  "download_delivery_mode": {
+    "type": "string",
+    "description": "附件交付方式",
+    "options": ["direct", "qq_file"],
+    "hint": "默认direct：提供无落盘下载链接；proxy_enabled开启时经服务器内存转发，关闭时直连教学云。qq_file会先在服务器保存文件再发送QQ，占用服务器空间。",
+    "default": "direct"
+  },
+  "send_downloads_to_qq": {
+    "type": "bool",
+    "description": "下载后发送文件到当前QQ私聊",
+    "hint": "默认开启。服务器先校验缓存，再通过QQ发送；在QQ客户端点击下载或另存为可保存到电脑/手机。回执不明不自动重发。",
+    "default": true
+  },
+  "download_max_mb": {
+    "type": "int",
+    "description": "教学附件单文件下载上限（MiB）",
+    "hint": "默认 200，范围 1–512。下载目录累计上限 2 GiB，保留至少 512 MiB 磁盘空闲；不会自动删除旧文件。可通过QQ发送到当前私聊，不提交作业。",
+    "default": 200
+  },
+  "request_timeout_seconds": {
+    "type": "int",
+    "description": "Direct BUPT API request timeout",
+    "hint": "Timeout for CAS and Teaching Cloud requests. No public proxy is used.",
+    "default": 15
   },
   "push_enabled": {
     "type": "bool",
