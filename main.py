@@ -17,6 +17,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import File, Image, Plain, Record, Video
 from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
+from astrbot.api.web import request
 
 from .downloads import DownloadStore, checked_url
 from .stream_proxy import DownloadProxy
@@ -62,6 +63,12 @@ class Main(star.Star):
         self._proxy = DownloadProxy(self)
         context.register_web_api("/astrbot_plugin_ucloud/download/<ticket>",
                                  self.proxy_download, ["GET"], "Authenticated no-disk UCloud streaming download")
+        context.register_web_api(
+            "/api/v1/companion/tools/ucloud/query",
+            self.companion_query,
+            ["POST"],
+            "Companion authenticated read-only UCloud bridge",
+        )
         self._client = DirectUCloudClient(
             timeout_seconds=float(self.config.get("request_timeout_seconds", 15))
         )
@@ -592,6 +599,108 @@ class Main(star.Star):
     async def proxy_download(self, ticket):
         from astrbot.api.web import request
         return await self._proxy.response(ticket, request.headers.get("Range"))
+
+    @staticmethod
+    def _companion_bridge_config() -> dict[str, Any]:
+        path = os.environ.get("COMPANION_REACTION_BRIDGE_CONFIG", "").strip()
+        if not path:
+            return {}
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def companion_query(self) -> dict[str, Any]:
+        """Run a narrow read-only query for the bound Companion owner"""
+        config = self._companion_bridge_config()
+        expected = str(config.get("token") or "").strip()
+        supplied = str(request.headers.get("X-Companion-Token") or "").strip()
+        if not expected or not supplied or not secrets.compare_digest(expected, supplied):
+            return {"success": False, "error": "未授权", "status_code": 401}
+        payload = await request.json(default={}) or {}
+        scope = config.get("scope") if isinstance(config.get("scope"), dict) else {}
+        subject_id = str(payload.get("subject_id") or "").strip()
+        if not subject_id or subject_id != str(scope.get("subject_id") or ""):
+            return {"success": False, "error": "作用域不匹配", "status_code": 403}
+        action = str(payload.get("action") or "").strip()
+        if action not in {"status", "configure", "courses", "tasks", "detail", "files"}:
+            return {"success": False, "error": "只读桥不支持此操作", "status_code": 400}
+        reference = str(payload.get("reference") or "").strip()[:160]
+        try:
+            page = int(payload.get("page", 1))
+        except (TypeError, ValueError):
+            page = 0
+        if not 1 <= page <= 100:
+            return {"success": False, "error": "页码无效", "status_code": 400}
+        accounts = await self._read_accounts()
+        sessions = [
+            key for key in accounts
+            if key.rsplit(":", 1)[-1] == subject_id
+            and str(accounts[key].get("session") or "") == key
+        ]
+        if action == "configure":
+            changes = payload.get("changes")
+            fields = {"push_interval_seconds", "delivery_mode", "proxy_enabled"}
+            if not isinstance(changes, dict) or set(changes) != fields:
+                return {"success": False, "error": "配置字段不完整", "status_code": 400}
+            interval = changes["push_interval_seconds"]
+            delivery = changes["delivery_mode"]
+            proxy = changes["proxy_enabled"]
+            if type(interval) is not int or not 60 <= interval <= 86400:
+                return {"success": False, "error": "轮询间隔无效", "status_code": 400}
+            if delivery not in {"direct", "qq_file"} or type(proxy) is not bool:
+                return {"success": False, "error": "交付配置无效", "status_code": 400}
+            persisted = {
+                "push_interval_seconds": interval,
+                "download_delivery_mode": delivery,
+                "proxy_enabled": proxy,
+            }
+            previous = {key: self.config.get(key) for key in persisted}
+            try:
+                await asyncio.to_thread(self.config.save_config, persisted)
+            except Exception:
+                self.config.update(previous)
+                logger.exception("Companion UCloud configuration save failed")
+                return {"success": False, "error": "配置保存失败", "status_code": 500}
+            return {"success": True, "data": {"updated": True}}
+        if action == "status":
+            return {
+                "success": True,
+                "data": {
+                    "configured": len(sessions) == 1,
+                    "saved_accounts": len(sessions),
+                    "refresh_credentials": sum(
+                        bool(accounts[key].get("refresh_token")) for key in sessions
+                    ),
+                    "push_enabled": bool(self.config.get("push_enabled", True)),
+                    "push_interval_seconds": self.config.get(
+                        "push_interval_seconds", 900
+                    ),
+                    "delivery_mode": self.config.get(
+                        "download_delivery_mode", "direct"
+                    ),
+                    "proxy_enabled": bool(self.config.get("proxy_enabled", True)),
+                },
+            }
+        if len(sessions) != 1:
+            return {"success": False, "error": "未找到唯一绑定账号", "status_code": 409}
+
+        class ReadOnlyEvent:
+            unified_msg_origin = sessions[0]
+
+            @staticmethod
+            def is_private_chat() -> bool:
+                return True
+
+            @staticmethod
+            def plain_result(text: str) -> str:
+                return text
+
+        text = await self.learning_files(
+            ReadOnlyEvent(), action, reference=reference, page=page
+        )
+        return {"success": True, "data": {"text": str(text)[:20000]}}
 
     @staticmethod
     async def _tool_text(generator):

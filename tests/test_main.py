@@ -126,6 +126,135 @@ class DownloadCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("仅限私聊", text)
         self.plugin._client.get_course_resources.assert_not_awaited()
 
+    async def test_companion_readonly_bridge_binds_token_and_owner(self):
+        self.plugin._read_accounts.return_value = {
+            "Perrin:FriendMessage:2533667996": {
+                "username": "student",
+                "session": "Perrin:FriendMessage:2533667996",
+            }
+        }
+        self.plugin.learning_files = AsyncMock(return_value="当前没有未完成待办")
+        self.plugin._companion_bridge_config = Mock(return_value={
+            "token": "service-token",
+            "scope": {"subject_id": "2533667996"},
+        })
+        fake_request = SimpleNamespace(
+            headers={"X-Companion-Token": "service-token"},
+            json=AsyncMock(return_value={
+                "subject_id": "2533667996", "action": "tasks", "page": 1,
+            }),
+        )
+        with patch("astrbot_plugin_ucloud.main.request", fake_request):
+            result = await self.plugin.companion_query()
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["text"], "当前没有未完成待办")
+        event = self.plugin.learning_files.await_args.args[0]
+        self.assertEqual(event.unified_msg_origin, "Perrin:FriendMessage:2533667996")
+        self.assertTrue(event.is_private_chat())
+
+    async def test_companion_status_bridge_returns_only_sanitized_state(self):
+        self.plugin._read_accounts.return_value = {
+            "Perrin:FriendMessage:2533667996": {
+                "username": "student",
+                "password": "private-password",
+                "session": "Perrin:FriendMessage:2533667996",
+                "refresh_token": "private-refresh",
+            }
+        }
+        self.plugin.config = {
+            "push_enabled": True,
+            "push_interval_seconds": 600,
+            "download_delivery_mode": "qq_file",
+            "proxy_enabled": False,
+        }
+        self.plugin._companion_bridge_config = Mock(return_value={
+            "token": "service-token",
+            "scope": {"subject_id": "2533667996"},
+        })
+        fake_request = SimpleNamespace(
+            headers={"X-Companion-Token": "service-token"},
+            json=AsyncMock(return_value={
+                "subject_id": "2533667996", "action": "status", "page": 1,
+            }),
+        )
+        with patch("astrbot_plugin_ucloud.main.request", fake_request):
+            result = await self.plugin.companion_query()
+        self.assertEqual(result, {"success": True, "data": {
+            "configured": True,
+            "saved_accounts": 1,
+            "refresh_credentials": 1,
+            "push_enabled": True,
+            "push_interval_seconds": 600,
+            "delivery_mode": "qq_file",
+            "proxy_enabled": False,
+        }})
+        self.assertNotIn("private-password", str(result))
+        self.assertNotIn("private-refresh", str(result))
+
+    async def test_companion_configure_bridge_persists_only_allowlisted_fields(self):
+        class Config(dict):
+            def __init__(self):
+                super().__init__(password="private", download_delivery_mode="direct")
+                self.saved = []
+
+            def save_config(self, changes):
+                self.saved.append(dict(changes))
+                self.update(changes)
+
+        config = Config()
+        self.plugin.config = config
+        self.plugin._read_accounts.return_value = {}
+        self.plugin._companion_bridge_config = Mock(return_value={
+            "token": "service-token",
+            "scope": {"subject_id": "2533667996"},
+        })
+        body = {
+            "subject_id": "2533667996",
+            "action": "configure",
+            "changes": {
+                "push_interval_seconds": 600,
+                "delivery_mode": "qq_file",
+                "proxy_enabled": True,
+            },
+        }
+        fake_request = SimpleNamespace(
+            headers={"X-Companion-Token": "service-token"},
+            json=AsyncMock(return_value=body),
+        )
+        with patch("astrbot_plugin_ucloud.main.request", fake_request):
+            result = await self.plugin.companion_query()
+        self.assertEqual(result, {"success": True, "data": {"updated": True}})
+        self.assertEqual(config.saved, [{
+            "push_interval_seconds": 600,
+            "download_delivery_mode": "qq_file",
+            "proxy_enabled": True,
+        }])
+        self.assertEqual(config["password"], "private")
+
+        body["changes"]["password"] = "changed"
+        with patch("astrbot_plugin_ucloud.main.request", fake_request):
+            rejected = await self.plugin.companion_query()
+        self.assertFalse(rejected["success"])
+        self.assertEqual(len(config.saved), 1)
+
+    async def test_companion_readonly_bridge_rejects_cross_user_and_writes(self):
+        self.plugin._companion_bridge_config = Mock(return_value={
+            "token": "service-token",
+            "scope": {"subject_id": "2533667996"},
+        })
+        for body in (
+            {"subject_id": "other", "action": "tasks"},
+            {"subject_id": "2533667996", "action": "download"},
+        ):
+            fake_request = SimpleNamespace(
+                headers={"X-Companion-Token": "service-token"},
+                json=AsyncMock(return_value=body),
+            )
+            with patch("astrbot_plugin_ucloud.main.request", fake_request):
+                result = await self.plugin.companion_query()
+            self.assertFalse(result["success"])
+        self.plugin._read_accounts.assert_not_awaited()
+
     async def test_persona_reply_uses_selected_conversation_persona(self):
         provider = SimpleNamespace(
             text_chat=AsyncMock(
