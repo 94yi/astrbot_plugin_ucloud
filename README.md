@@ -15,7 +15,7 @@ source history.
 
 ## QQ 提交入口（Companion 分流）
 
-在私聊发送“提交作业”“云邮提交作业”或“帮我提交作业”，即可进入原有作业选择和草稿预览。也可继续使用下方斜杠命令；最终上传并提交仍需一次性确认码，自然语言不会直接提交。
+在私聊发送“提交作业”“云邮提交作业”或“帮我提交作业”，即可进入原有作业选择和草稿预览。也可继续使用下方斜杠命令；查看非空草稿预览后，60 秒内在同一私聊拍一下 bot 即确认上传并提交该草稿；也可使用一次性确认码。继续聊天会使拍一拍确认失效，修改草稿后的新预览重新计时。过期后请 `/ucloud_preview` 重看预览。群聊、拍错对象、bot 自拍和重复通知不能提交，自然语言不会直接提交。
 
 与 Companion 同时部署时，需要其云邮路由模块和 I/O guard 配套版本。选作业和附件接收的三分钟会话以 bot/用户隔离，仅转交对应序号、取消或文件/图片；普通聊天和其他用户不会被接管。路由元数据不含账号、口令和附件内容，结束或重启后清除。独立 AstrBot 部署不依赖 Companion。
 
@@ -127,6 +127,6 @@ payload to `/ykt-site/work/submit`. Individual and group assignments are
 supported when UCloud exposes the student's group ID.
 
 Nothing is uploaded when a draft is created, edited, previewed, or cancelled.
-The irreversible request only runs after `/ucloud_confirm` with the current
+The irreversible request only runs after a scoped private poke within 60 seconds of the latest preview, or `/ucloud_confirm` with the current
 one-time code. Immediately before that request the plugin refreshes submission
 state and refuses to proceed if the assignment changed in another browser.

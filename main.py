@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import nullcontext
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -55,6 +56,8 @@ class Main(star.Star):
         self._drafts: dict[str, dict[str, Any]] = {}
         self._task_lists: dict[str, dict[str, Any]] = {}
         self._submit_locks: dict[str, asyncio.Lock] = {}
+        self._poke_windows = {}
+        self._confirmation_pokes = {}
         self._resource_lists = {}
         self._download_jobs = set()
         self._downloads = None
@@ -118,6 +121,8 @@ class Main(star.Star):
         self._drafts.clear()
         self._task_lists.clear()
         self._submit_locks.clear()
+        for key in list(getattr(self, "_poke_windows", {})):
+            self._close_poke_window(key)
 
     async def _read_accounts(self) -> dict[str, dict[str, Any]]:
         """Load validated account records from local persistent storage."""
@@ -250,8 +255,8 @@ class Main(star.Star):
             result.append({"path": str(file_path), "name": Path(name).name})
         return result
 
-    @staticmethod
-    def _draft_preview(draft: dict[str, Any]) -> str:
+    def _draft_preview(self, draft: dict[str, Any], event=None) -> str:
+        armed = event is not None and self._arm_poke_confirmation(event, draft)
         content = str(draft.get("content") or "")
         shown = content if len(content) <= 500 else content[:500] + "\n…（预览已截断）"
         attachments = draft.get("attachments", [])
@@ -274,7 +279,9 @@ class Main(star.Star):
             f"状态：{draft['permission']}\n截止：{draft.get('deadline') or '-'}\n\n"
             f"正文（{len(content)}/{MAX_CONTENT_LENGTH}）：\n{shown or '（无）'}\n\n"
             f"附件（{len(attachments)}/{MAX_ATTACHMENTS}）：\n{attachment_text}\n\n"
-            f"确认码：{draft['code']}\n"
+            + ("确认提交：60 秒内在私聊拍一下 bot，将提交以上正文和附件。\n"
+             if armed else "")
+            + f"确认码：{draft['code']}\n"
             f"确认提交：/ucloud_confirm {draft['code']}\n"
             "继续编辑：/ucloud_content 正文；发送附件：先 /ucloud_attach，再单独发送文件/图片；"
             "删除附件：/ucloud_remove 序号；取消：/ucloud_cancel"
@@ -1154,6 +1161,7 @@ class Main(star.Star):
         except (TypeError, ValueError):
             assignment_status = 99
         draft = {
+            "account_username": str(account.get("username") or ""),
             "activity_id": activity_id,
             "title": str(detail.get("assignmentTitle") or "未命名作业"),
             "deadline": str(detail.get("assignmentEndTime") or ""),
@@ -1168,7 +1176,91 @@ class Main(star.Star):
             "expires_at": time.monotonic() + DRAFT_TTL_SECONDS,
         }
         self._drafts[key] = draft
-        return self._draft_preview(draft)
+        return self._draft_preview(draft, event)
+
+    @staticmethod
+    def _draft_fingerprint(draft):
+        return hashlib.sha256(json.dumps(draft, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def _close_poke_window(self, key):
+        window = getattr(self, "_poke_windows", {}).pop(key, None)
+        if window:
+            window["timer"].cancel()
+            window["lease"].__exit__(None, None, None)
+
+    def _invalidate_poke_window(self, key):
+        window = getattr(self, "_poke_windows", {}).get(key)
+        if window:
+            # Retain routing ownership until expiry to absorb duplicate notices.
+            window["ready"] = False
+
+    def _arm_poke_confirmation(self, event, draft):
+        if (not hasattr(event, "get_platform_name") or event.get_platform_name() != "aiocqhttp"
+                or not event.is_private_chat() or not getattr(self, "_store_path", None)
+                or not (str(draft.get("content") or "").strip() or draft.get("attachments"))):
+            return False
+        key = event.unified_msg_origin
+        self._close_poke_window(key)
+        lease = self._submission_route(event, "confirmation")
+        route = lease.__enter__()
+        if not route:
+            lease.__exit__(None, None, None)
+            return False
+        if not hasattr(self, "_poke_windows"):
+            self._poke_windows = {}
+        self._poke_windows[key] = {
+            "lease": lease, "ready": True,
+            "bot": str(event.get_self_id()), "user": str(event.get_sender_id()),
+            "fingerprint": self._draft_fingerprint(draft), "code": draft["code"],
+            "opened": int(time.time()), "expires": time.monotonic() + 60,
+            "timer": asyncio.get_running_loop().call_later(60, self._close_poke_window, key),
+        }
+        return True
+
+    async def handle_submission_confirmation(self, event):
+        """Consume only a fresh private user-to-bot OneBot notice for this preview."""
+        key = event.unified_msg_origin
+        window = getattr(self, "_poke_windows", {}).get(key)
+        if not window:
+            return False
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if not isinstance(raw, dict):
+            self._invalidate_poke_window(key)
+            return False
+        if not (raw.get("post_type") == "notice" and raw.get("notice_type") == "notify"
+                and raw.get("sub_type") == "poke"):
+            # Further chat or editing ends this gesture's confirmation window.
+            self._invalidate_poke_window(key)
+            return False
+        actor = str(raw.get("sender_id") if raw.get("sender_id") is not None else raw.get("user_id"))
+        if (raw.get("group_id") or not event.is_private_chat()
+                or str(raw.get("self_id")) != window["bot"]
+                or str(raw.get("target_id")) != window["bot"]
+                or actor != window["user"] or actor == window["bot"]
+                or str(event.get_sender_id()) != window["user"]
+                or str(event.get_self_id()) != window["bot"]):
+            return False
+        if time.monotonic() >= window["expires"]:
+            self._close_poke_window(key)
+            return False
+        # A consumed or invalidated window swallows duplicate notices without replying.
+        if not window["ready"]:
+            return True
+        stamp = raw.get("time")
+        if type(stamp) not in (int, float) or not window["opened"] <= stamp <= time.time() + 5:
+            return True
+        identity = hashlib.sha256(json.dumps(raw, sort_keys=True).encode()).hexdigest()
+        seen = getattr(self, "_confirmation_pokes", {})
+        now = time.monotonic()
+        self._confirmation_pokes = {item: expiry for item, expiry in seen.items() if expiry > now}
+        if identity in self._confirmation_pokes:
+            return True
+        self._confirmation_pokes[identity] = now + 300
+        window["ready"] = False
+        event.stop_event()
+        async for result in self._execute_submission(event, window["code"], expected_snapshot=window["fingerprint"]):
+            await event.send(result)
+        return True
 
     def _submission_route(self, event, mode):
         """Export only a bounded QQ picker/attachment lease when Companion is installed."""
@@ -1333,7 +1425,7 @@ class Main(star.Star):
         draft["content"] = content
         draft["code"] = secrets.token_hex(3).upper()
         draft["expires_at"] = time.monotonic() + DRAFT_TTL_SECONDS
-        yield event.plain_result(self._draft_preview(draft))
+        yield event.plain_result(self._draft_preview(draft, event))
 
     @filter.command("ucloud_attach")
     async def attach_to_submission(self, event: AstrMessageEvent):
@@ -1405,7 +1497,7 @@ class Main(star.Star):
                     draft["code"] = secrets.token_hex(3).upper()
                     draft["expires_at"] = time.monotonic() + DRAFT_TTL_SECONDS
                     await self.context.send_message(
-                        key, MessageChain([Plain(self._draft_preview(draft))])
+                        key, MessageChain([Plain(self._draft_preview(draft, attachment_event))])
                     )
                     attachment_event.stop_event()
                     controller.stop()
@@ -1421,7 +1513,7 @@ class Main(star.Star):
         draft["attachments"].extend(incoming)
         draft["code"] = secrets.token_hex(3).upper()
         draft["expires_at"] = time.monotonic() + DRAFT_TTL_SECONDS
-        yield event.plain_result(self._draft_preview(draft))
+        yield event.plain_result(self._draft_preview(draft, event))
 
     @filter.command("ucloud_remove")
     async def remove_submission_attachment(
@@ -1447,7 +1539,7 @@ class Main(star.Star):
                 return
         draft["code"] = secrets.token_hex(3).upper()
         draft["expires_at"] = time.monotonic() + DRAFT_TTL_SECONDS
-        yield event.plain_result(self._draft_preview(draft))
+        yield event.plain_result(self._draft_preview(draft, event))
 
     @filter.command("ucloud_preview")
     async def preview_submission(self, event: AstrMessageEvent):
@@ -1459,7 +1551,7 @@ class Main(star.Star):
             return
         draft["code"] = secrets.token_hex(3).upper()
         draft["expires_at"] = time.monotonic() + DRAFT_TTL_SECONDS
-        yield event.plain_result(self._draft_preview(draft))
+        yield event.plain_result(self._draft_preview(draft, event))
 
     @filter.command("ucloud_cancel")
     async def cancel_submission(self, event: AstrMessageEvent):
@@ -1471,13 +1563,21 @@ class Main(star.Star):
 
     @filter.command("ucloud_confirm")
     async def confirm_submission(self, event: AstrMessageEvent, code: str = ""):
-        """Upload pending attachments and perform the final irreversible submit."""
+        """Confirm the displayed draft using its one-time code."""
+        async for result in self._execute_submission(event, code):
+            yield result
+
+    async def _execute_submission(self, event, code, *, expected_snapshot=None):
+        """Share the locked final state checks between code and gesture confirmation."""
         key = event.unified_msg_origin
         async with self._submit_locks.setdefault(key, asyncio.Lock()):
             draft = self._drafts.get(key)
             if not draft or float(draft.get("expires_at", 0)) <= time.monotonic():
                 self._drafts.pop(key, None)
                 yield event.plain_result("提交草稿不存在或已过期，请重新创建。")
+                return
+            if expected_snapshot is not None and self._draft_fingerprint(draft) != expected_snapshot:
+                yield event.plain_result("草稿已变化，未执行提交；请重新查看 /ucloud_preview。")
                 return
             if not code or not secrets.compare_digest(code.upper(), str(draft["code"])):
                 yield event.plain_result(
@@ -1487,9 +1587,15 @@ class Main(star.Star):
             if not str(draft.get("content") or "").strip() and not draft["attachments"]:
                 yield event.plain_result("与学生端一致：正文和附件至少需要一项。")
                 return
+            self._invalidate_poke_window(key)
+            # Freeze the checked payload before the first asynchronous account read.
+            draft = deepcopy(draft)
             account = await self._account(event)
             if not account:
                 yield event.plain_result("登录信息已不存在，未执行提交。")
+                return
+            if draft.get("account_username") is not None and str(account.get("username") or "") != draft["account_username"]:
+                yield event.plain_result("登录账号已变化，未执行提交；请重新创建草稿。")
                 return
             try:
                 userinfo = await self._userinfo(account)
@@ -1528,13 +1634,17 @@ class Main(star.Star):
                 logger.warning(
                     "UCloud submission failed: %s: %s", type(exc).__name__, exc
                 )
-                draft["code"] = secrets.token_hex(3).upper()
-                draft["expires_at"] = time.monotonic() + DRAFT_TTL_SECONDS
+                current = self._drafts.get(key)
+                if current and current.get("code") == code.upper():
+                    current["code"] = secrets.token_hex(3).upper()
+                    current["expires_at"] = time.monotonic() + DRAFT_TTL_SECONDS
                 yield event.plain_result(
                     f"提交失败：{exc}\n草稿仍保留；请 /ucloud_preview 检查后重试。"
                 )
                 return
-            self._drafts.pop(key, None)
+            current = self._drafts.get(key)
+            if current and current.get("code") == code.upper():
+                self._drafts.pop(key, None)
             yield event.plain_result(
                 f"提交成功：{draft['title']}（{draft['activity_id']}）。"
             )
