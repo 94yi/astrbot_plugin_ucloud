@@ -585,7 +585,8 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("1. 作业一", replies[0])
         self.assertIn("2. 作业二", replies[0])
-        self.assertIn("/ucloud_submit 序号", replies[0])
+        self.assertIn("/ucloud_detail 序号", replies[0])
+        self.assertNotIn("/ucloud_submit", replies[0])
         self.assertEqual(
             plugin._resolve_task_reference("session-1", "2"),
             ("1002", ""),
