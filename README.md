@@ -147,3 +147,10 @@ Course activities may include homework. A missing or `-1` `assignmentType` in th
 
 
 Read-only task lists use neutral course-task labels for unknown types and do not prompt submission. Discussing classifications, asking about functionality or reporting a bug is not a request to start submitting coursework. The model tool instructions preserve this distinction; only explicit submission entries open the draft workflow.
+
+
+### 自然语言查看与编辑草稿
+
+Companion 的 `manage_ucloud_draft` 支持查看预览、替换/清空正文、追加本轮指定附件、按序号或全部删除附件以及取消草稿，不提供模型确认提交动作。编辑后重新发预览，取消会清理草稿自有文件。缺少附件不进入异步接收等待；同一来源同一种操作只执行一次，草稿变化后旧回执不视为本次成功。所有操作与最终提交锁串行，失败投递会关闭拍一拍窗口。
+
+引用一条合并转发消息时，可读取其中指定文件；更深嵌套明确要求单独发送。所有转发合计最多二十条、附件十个，引用/转发最多四次读取，不静默丢弃更深层材料。

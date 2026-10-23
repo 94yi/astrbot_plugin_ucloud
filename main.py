@@ -697,7 +697,7 @@ class Main(star.Star):
         if not subject_id or subject_id != str(scope.get("subject_id") or ""):
             return {"success": False, "error": "作用域不匹配", "status_code": 403}
         action = str(payload.get("action") or "").strip()
-        if action not in {"status", "configure", "courses", "tasks", "detail", "files", "prepare_submission"}:
+        if action not in {"status", "configure", "courses", "tasks", "detail", "files", "prepare_submission", "manage_submission"}:
             return {"success": False, "error": "只读桥不支持此操作", "status_code": 400}
         reference = str(payload.get("reference") or "").strip()[:160]
         try:
@@ -759,10 +759,11 @@ class Main(star.Star):
         if len(sessions) != 1:
             return {"success": False, "error": "未找到唯一绑定账号", "status_code": 409}
 
-        if action == "prepare_submission":
-            from .submission_tool import prepare_submission
+        if action in {"prepare_submission", "manage_submission"}:
+            from .submission_tool import prepare_submission, manage_submission
             try:
-                data = await prepare_submission(self, payload, scope, sessions[0])
+                handler = prepare_submission if action == "prepare_submission" else manage_submission
+                data = await handler(self, payload, scope, sessions[0])
             except (httpx.HTTPError, UCloudError, OSError, ValueError, KeyError) as exc:
                 data = {"prepared": False, "submitted": False, "text": str(exc)[:400]}
             return {"success": True, "data": data}
