@@ -1,5 +1,6 @@
 """Unknown task-list types must be verified rather than excluded from homework."""
 
+import asyncio
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
@@ -62,7 +63,7 @@ class ActivityClassificationTests(unittest.IsolatedAsyncioTestCase):
         try:
             prompt = await anext(generator)
             self.assertIn("实验报告", prompt)
-            self.assertIn("提交方式待确认", prompt)
+            self.assertIn("课程任务", prompt)
         finally:
             await generator.aclose()
         self.plugin._client.get_homework.assert_not_awaited()
@@ -97,3 +98,18 @@ class ActivityClassificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("提交类型尚未接入", replies[0])
         self.assertFalse(self.plugin._drafts)
         self.plugin._client.submit_homework.assert_not_awaited()
+
+    async def test_readonly_task_list_does_not_open_or_prompt_submission(self):
+        self.plugin._store_lock = asyncio.Lock()
+        self.plugin._read_accounts = AsyncMock(
+            return_value={Event.unified_msg_origin: {"username": "test-student"}}
+        )
+        self.plugin._fetch = AsyncMock(return_value={"undoneList": [self.item]})
+        self.plugin._prepare_submission_draft = AsyncMock()
+        replies = [r async for r in self.plugin.tasks(Event())]
+        self.assertIn("实验报告", replies[0])
+        self.assertIn("课程任务", replies[0])
+        self.assertNotIn("/ucloud_submit", replies[0])
+        self.assertNotIn("确认提交", replies[0])
+        self.assertFalse(self.plugin._drafts)
+        self.plugin._prepare_submission_draft.assert_not_awaited()

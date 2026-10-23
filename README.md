@@ -135,3 +135,6 @@ state and refuses to proceed if the assignment changed in another browser.
 ### Course activity classification
 
 Course activities may include homework. A missing or `-1` `assignmentType` in the task list is treated as unknown, and does not block detail, attachment lookup or draft selection. The selected task is checked through the homework detail and submission-state APIs; only supported individual/group assignment types with a permitted server state produce a draft. Unrecognized data is reported as unverified, not as proof that the activity is not homework. No upload or submission occurs during this check.
+
+
+Read-only task lists use neutral course-task labels for unknown types and do not prompt submission. Discussing classifications, asking about functionality or reporting a bug is not a request to start submitting coursework. The model tool instructions preserve this distinction; only explicit submission entries open the draft workflow.
