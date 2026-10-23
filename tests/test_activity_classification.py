@@ -55,6 +55,16 @@ class ActivityClassificationTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._client.upload_attachment.assert_not_awaited()
         self.plugin._client.submit_homework.assert_not_awaited()
 
+    async def test_expected_course_is_rechecked_before_draft_or_submission_state(self):
+        self.plugin._client.get_homework.return_value["courseInfo"] = {"name": "C语言程序设计"}
+        reply = await self.plugin._prepare_submission_draft(Event(), "activity-1", expected_course="高等数学")
+        self.assertIn("未创建草稿", reply)
+        self.plugin._client.get_submission_state.assert_not_awaited()
+        self.assertFalse(self.plugin._drafts)
+        reply = await self.plugin._prepare_submission_draft(Event(), "activity-1", expected_course="C语言程序设计")
+        self.assertIn("作业提交预览", reply)
+        self.plugin._client.submit_homework.assert_not_awaited()
+
     async def test_picker_keeps_unknown_activities_for_selected_item_verification(self):
         event = Event()
         event.message_str = "/ucloud_submit"

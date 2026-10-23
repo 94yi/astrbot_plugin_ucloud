@@ -685,7 +685,7 @@ class Main(star.Star):
         return payload if isinstance(payload, dict) else {}
 
     async def companion_query(self) -> dict[str, Any]:
-        """Run a narrow read-only query for the bound Companion owner"""
+        """Run owner-bound queries or prepare a separately confirmed submission preview."""
         config = self._companion_bridge_config()
         expected = str(config.get("token") or "").strip()
         supplied = str(request.headers.get("X-Companion-Token") or "").strip()
@@ -697,7 +697,7 @@ class Main(star.Star):
         if not subject_id or subject_id != str(scope.get("subject_id") or ""):
             return {"success": False, "error": "作用域不匹配", "status_code": 403}
         action = str(payload.get("action") or "").strip()
-        if action not in {"status", "configure", "courses", "tasks", "detail", "files"}:
+        if action not in {"status", "configure", "courses", "tasks", "detail", "files", "prepare_submission"}:
             return {"success": False, "error": "只读桥不支持此操作", "status_code": 400}
         reference = str(payload.get("reference") or "").strip()[:160]
         try:
@@ -758,6 +758,14 @@ class Main(star.Star):
             }
         if len(sessions) != 1:
             return {"success": False, "error": "未找到唯一绑定账号", "status_code": 409}
+
+        if action == "prepare_submission":
+            from .submission_tool import prepare_submission
+            try:
+                data = await prepare_submission(self, payload, scope, sessions[0])
+            except (httpx.HTTPError, UCloudError, OSError, ValueError, KeyError) as exc:
+                data = {"prepared": False, "submitted": False, "text": str(exc)[:400]}
+            return {"success": True, "data": data}
 
         class ReadOnlyEvent:
             unified_msg_origin = sessions[0]
@@ -1139,6 +1147,7 @@ class Main(star.Star):
         event: AstrMessageEvent,
         activity_id: str,
         supplied_content: str | None = None,
+        *, expected_course: str = "",
     ) -> str:
         """Create a submission draft for one assignment.
 
@@ -1165,6 +1174,14 @@ class Main(star.Star):
             detail = await self._client.get_homework(userinfo, activity_id)
             if not self._has_homework_detail(detail):
                 return "该任务尚未返回可识别的作业详情，未创建提交草稿；请查看教学云对应页面。"
+            if expected_course:
+                course_info = detail.get("courseInfo") or {}
+                names = [detail.get("courseName"), detail.get("siteName")]
+                if isinstance(course_info, dict):
+                    names += [course_info.get("name"), course_info.get("courseName"), course_info.get("siteName")]
+                normalize = lambda text: re.sub(r"\s+", "", str(text or "")).casefold()
+                if normalize(expected_course) not in {normalize(name) for name in names if name}:
+                    return "作业详情与指定课程不匹配或课程名尚未核实，未创建草稿；请先确认课程和作业。"
             state = await self._client.get_submission_state(userinfo, activity_id)
             allowed, permission = submission_permission(state)
             if not allowed:
