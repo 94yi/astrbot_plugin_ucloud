@@ -122,3 +122,18 @@ class DraftControlTests(unittest.IsolatedAsyncioTestCase):
             await self.call("preview")
         self.assertFalse(self.plugin._poke_windows)
         self.no_submit()
+
+
+    async def test_preview_returns_only_safe_names_and_indices_for_model_selection(self):
+        self.draft["attachments"] = [
+            {"name": "wrong.pdf", "path": "/private/original", "resource_id": "secret-id"},
+            {"name": "answer.pdf", "resource_id": "remote-id"},
+        ]
+        result = await self.call("preview")
+        self.assertEqual(result["draft"]["attachments"], [{"index": 1, "name": "wrong.pdf"}, {"index": 2, "name": "answer.pdf"}])
+        self.assertNotIn("account_username", result["draft"])
+        self.assertNotIn("code", result["draft"])
+        self.assertNotIn("path", str(result))
+        result = await self.call("remove_attachment", attachment_index=1)
+        self.assertEqual(result["draft"]["attachments"], [{"index": 1, "name": "answer.pdf"}])
+        self.no_submit()

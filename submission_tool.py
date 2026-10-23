@@ -56,6 +56,17 @@ async def _media(bot, segments, *, quoted, forwards=False, budget=None, reject_n
     return result
 
 
+def _draft_summary(draft):
+    if not draft:
+        return None
+    return {
+        "title": str(draft.get("title") or ""),
+        "content_length": len(str(draft.get("content") or "")),
+        "attachments": [{"index": index, "name": str(item.get("name") or "")}
+                        for index, item in enumerate(draft.get("attachments", []), 1)],
+    }
+
+
 async def _verified_event(plugin, payload, scope, session, *, include_media=True):
     message_id = payload["message_id"]
     quoted = payload.get("use_quoted_files", False)
@@ -153,6 +164,7 @@ async def prepare_submission(plugin, payload, scope, session):
             plugin._close_attachment_window(session)
             raise
         result = {"prepared": True, "submitted": False, "preview_sent": True,
+                  "draft": _draft_summary(draft),
                   "text": "已发送作业预览，等待用户确认；尚未上传或提交。"}
         plugin._prepared_tool_sources[source_id] = {
             "request": dict(payload), "result": result, "expires": time.monotonic() + 600,
@@ -234,6 +246,7 @@ async def manage_submission(plugin, payload, scope, session):
             result = {"prepared": prepared, "submitted": False, "preview_sent": prepared,
                       "cancelled": operation == "cancel" and draft is not None and current is None,
                       "response_sent": True, "operation": operation,
+                      "draft": _draft_summary(current),
                       "text": ("新预览已发送，尚未正式提交。" if prepared else
                                "草稿已取消，没有执行正式提交。" if operation == "cancel" and draft is not None and current is None else
                                "\n".join(reply if isinstance(reply, str) else reply.get_plain_text() for reply in replies)[:2000])}
