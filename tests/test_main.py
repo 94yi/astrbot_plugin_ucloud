@@ -608,7 +608,7 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
             ("100200", ""),
         )
 
-    async def test_non_assignment_detail_does_not_call_homework_api(self) -> None:
+    async def test_unknown_list_type_still_reads_actual_homework_detail(self) -> None:
         plugin = object.__new__(Main)
         plugin._store_lock = asyncio.Lock()
         plugin._task_lists = {}
@@ -628,13 +628,13 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
         plugin._read_accounts = AsyncMock(
             return_value={"session-1": {"username": "student"}}
         )
-        plugin._fetch = AsyncMock()
+        plugin._fetch = AsyncMock(return_value={"assignmentTitle": "实际作业", "assignmentContent": "提交实验报告"})
 
         replies = await _collect(plugin.detail(_Event(), "1"))
 
-        self.assertIn("登录状态正常", replies[0])
-        self.assertIn("学习活动", replies[0])
-        plugin._fetch.assert_not_awaited()
+        self.assertIn("实际作业", replies[0])
+        self.assertNotIn("不是作业", replies[0])
+        plugin._fetch.assert_awaited_once_with({"username": "student"}, "/homework?id=unit-1")
 
     async def test_submit_picker_maps_reply_number_to_snapshot(self) -> None:
         selected: list[str] = []

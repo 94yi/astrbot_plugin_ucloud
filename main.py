@@ -360,15 +360,21 @@ class Main(star.Star):
         title = str(task.get("activityName") or "未命名待办")
         deadline = str(task.get("endTime") or "未提供")
         activity_id = str(task.get("activityId") or "-")
-        kind = "学习活动" if not self._is_assignment_task(task) else "作业"
+        kind = "课程任务（提交方式待确认）" if not self._is_assignment_task(task) else "作业（提交状态待核验）"
         return (
             f"• {title}\n  类型：{kind}｜课程：{course_name}｜截止：{deadline}\n  ID：{activity_id}"
         )
 
     @staticmethod
     def _is_assignment_task(task: dict[str, Any]) -> bool:
-        """Distinguish homework from chapter/unit learning activities."""
-        return str(task.get("assignmentType", "")) != "-1"
+        """Treat list metadata as a hint, never as submission authority."""
+        return str(task.get("assignmentType", "")) in {"0", "1"}
+
+    @staticmethod
+    def _has_homework_detail(data):
+        return isinstance(data, dict) and bool({
+            "assignmentTitle", "assignmentId", "assignmentContent", "assignmentEndTime",
+        } & data.keys())
 
     def _remember_task_list(self, key: str, items: list[dict[str, Any]]) -> None:
         """Cache the exact numbered list shown to one session."""
@@ -520,7 +526,7 @@ class Main(star.Star):
             text += f"\n\n…其余 {len(items) - len(shown)} 项未显示。"
         text += (
             "\n\n10 分钟内可使用 /ucloud_detail 序号 查看；"
-            "只有标记为作业的项目才能使用 /ucloud_submit 序号 [正文]"
+            "使用 /ucloud_submit 序号 [正文] 查询提交条件；是否可交以详情和当前状态为准"
         )
         yield event.plain_result(text)
 
@@ -541,17 +547,6 @@ class Main(star.Star):
         )
         if reference_error:
             yield event.plain_result(reference_error)
-            return
-        snapshot_item = self._task_snapshot_item(
-            event.unified_msg_origin, activity_id
-        )
-        if snapshot_item and not self._is_assignment_task(snapshot_item):
-            course = str(snapshot_item.get("siteName") or "未知课程")
-            deadline = str(snapshot_item.get("endTime") or "未提供")
-            yield event.plain_result(
-                "登录状态正常，这项待办属于课程学习活动，不是作业，"
-                f"教学云没有对应的作业详情接口\n课程：{course}｜截止：{deadline}"
-            )
             return
         async with self._store_lock:
             account = (await self._read_accounts()).get(event.unified_msg_origin)
@@ -574,8 +569,8 @@ class Main(star.Star):
                 "账号仍已保存，但教学云作业详情接口暂时异常，请稍后重试"
             )
             return
-        if not isinstance(data, dict):
-            yield event.plain_result("教学云返回了无法识别的作业详情。")
+        if not self._has_homework_detail(data):
+            yield event.plain_result("该任务尚未返回可识别的作业详情，无法确认其提交方式；请查看教学云对应页面。")
             return
         course = (
             data.get("courseInfo") if isinstance(data.get("courseInfo"), dict) else {}
@@ -961,11 +956,6 @@ class Main(star.Star):
                 reference, error = self._resolve_task_reference(event.unified_msg_origin, reference)
                 if error:
                     raise UCloudAPIError(error)
-                snapshot_item = self._task_snapshot_item(
-                    event.unified_msg_origin, reference
-                )
-                if snapshot_item and not self._is_assignment_task(snapshot_item):
-                    raise UCloudAPIError("这项待办是学习活动，不是作业，没有作业附件接口")
             elif not reference[7:].isdigit():
                 raise UCloudAPIError("课程 ID 应为数字；先使用 /ucloud_courses 查询")
             userinfo = await self._userinfo(account)
@@ -1106,11 +1096,15 @@ class Main(star.Star):
         try:
             userinfo = await self._userinfo(account)
             detail = await self._client.get_homework(userinfo, activity_id)
+            if not self._has_homework_detail(detail):
+                return "该任务尚未返回可识别的作业详情，未创建提交草稿；请查看教学云对应页面。"
             state = await self._client.get_submission_state(userinfo, activity_id)
             allowed, permission = submission_permission(state)
             if not allowed:
                 return permission
             assignment_type = int(detail.get("assignmentType", 0))
+            if assignment_type not in {0, 1}:
+                return "该任务返回的提交类型尚未接入，未创建提交草稿；请在教学云页面操作。"
             task: dict[str, Any] = {}
             if assignment_type == 1:
                 undone = await self._client.get_undone_list(userinfo)
@@ -1295,12 +1289,6 @@ class Main(star.Star):
             if reference_error:
                 yield event.plain_result(reference_error)
                 return
-            snapshot_item = self._task_snapshot_item(
-                event.unified_msg_origin, activity_id
-            )
-            if snapshot_item and not self._is_assignment_task(snapshot_item):
-                yield event.plain_result("这项待办是学习活动，不是可提交的作业")
-                return
             supplied_content = args[1] if len(args) > 1 else None
             result = await self._prepare_submission_draft(
                 event, activity_id, supplied_content
@@ -1337,7 +1325,6 @@ class Main(star.Star):
             for item in data.get("undoneList", [])
             if isinstance(item, dict)
             and item.get("activityId") is not None
-            and self._is_assignment_task(item)
         ]
         if not items:
             yield event.plain_result("当前没有可选择的未完成作业。")

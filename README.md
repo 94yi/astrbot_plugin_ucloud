@@ -130,3 +130,8 @@ Nothing is uploaded when a draft is created, edited, previewed, or cancelled.
 The irreversible request only runs after a scoped private poke within 60 seconds of the latest preview, or `/ucloud_confirm` with the current
 one-time code. Immediately before that request the plugin refreshes submission
 state and refuses to proceed if the assignment changed in another browser.
+
+
+### Course activity classification
+
+Course activities may include homework. A missing or `-1` `assignmentType` in the task list is treated as unknown, and does not block detail, attachment lookup or draft selection. The selected task is checked through the homework detail and submission-state APIs; only supported individual/group assignment types with a permitted server state produce a draft. Unrecognized data is reported as unverified, not as proof that the activity is not homework. No upload or submission occurs during this check.
