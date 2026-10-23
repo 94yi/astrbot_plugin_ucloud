@@ -47,7 +47,9 @@ class SubmissionToolTests(unittest.IsolatedAsyncioTestCase):
         self.fail("Unexpected platform action: " + name)
 
     async def prepare(self, event, activity, answer, **kwargs):
-        self.plugin._drafts[SESSION] = {"activity_id": activity, "expires_at": time.monotonic() + 1800}
+        self.plugin._drafts[SESSION] = {"activity_id": activity, "expires_at": time.monotonic() + 1800,
+                                        "code": "fake-code", "account_username": "fake", "content": "", "attachments": []}
+        self.plugin._attachment_windows = {SESSION: {"expires": time.monotonic() + 180}}
         return "作业预览，待确认"
 
     def no_remote_writes(self):
@@ -141,7 +143,9 @@ class SubmissionToolTests(unittest.IsolatedAsyncioTestCase):
         def prepare(event, activity, answer, **kwargs):
             self.assertEqual(len(event.get_messages()), 3)
             self.assertEqual([item.name for item in event.get_messages()[1:]], ["first.pdf", "second.pdf"])
-            self.plugin._drafts[SESSION] = {"activity_id": activity}
+            self.plugin._drafts[SESSION] = {"activity_id": activity, "code": "fake-code", "expires_at": time.monotonic() + 1800,
+                                            "account_username": "fake", "content": "", "attachments": []}
+            self.plugin._attachment_windows = {SESSION: {"expires": time.monotonic() + 180}}
             return "预览待确认"
         self.plugin._prepare_submission_draft.side_effect = prepare
         result = await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
@@ -169,4 +173,50 @@ class SubmissionToolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
         self.plugin._prepare_submission_draft.assert_not_awaited()
+        self.no_remote_writes()
+
+
+    async def test_preparation_replay_rejects_expired_or_changed_same_activity_draft(self):
+        await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
+        draft = self.plugin._drafts[SESSION]
+        original = deepcopy(draft)
+        for changes in ({"expires_at": 0}, {"code": "different"}, {"content": "changed without rotating code"}):
+            self.plugin._drafts[SESSION] = {**deepcopy(original), **changes}
+            result = await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
+            self.assertFalse(result["prepared"])
+            self.assertNotIn("draft", result)
+        self.plugin.context.send_message.assert_awaited_once()
+        self.no_remote_writes()
+
+    async def test_preparation_replay_rechecks_account_and_original_message_age(self):
+        await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
+        self.plugin._account.return_value = {"username": "changed"}
+        with self.assertRaises(ValueError):
+            await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
+        self.plugin._account.return_value = {"username": "fake"}
+        self.raw["time"] = time.time() - 601
+        with self.assertRaises(ValueError):
+            await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
+        self.plugin.context.send_message.assert_awaited_once()
+        self.no_remote_writes()
+
+    async def test_empty_preview_replay_does_not_report_active_receipt_after_receive_timeout(self):
+        await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
+        self.plugin._attachment_windows[SESSION]["expires"] = 0
+        result = await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
+        self.assertFalse(result["prepared"])
+        self.assertIn("窗口", result["text"])
+        self.plugin.context.send_message.assert_awaited_once()
+        self.no_remote_writes()
+
+
+    async def test_preview_delivery_mutation_does_not_create_a_successful_stale_receipt(self):
+        async def changed_during_delivery(*_args):
+            self.plugin._drafts[SESSION]["content"] = "changed while delivery awaited"
+        self.plugin.context.send_message.side_effect = changed_during_delivery
+        result = await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION)
+        self.assertFalse(result["prepared"])
+        self.assertNotIn("draft", result)
+        self.assertFalse((await prepare_submission(self.plugin, PAYLOAD, SCOPE, SESSION))["prepared"])
+        self.plugin.context.send_message.assert_awaited_once()
         self.no_remote_writes()

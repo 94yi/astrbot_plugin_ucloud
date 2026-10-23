@@ -137,3 +137,46 @@ class DraftControlTests(unittest.IsolatedAsyncioTestCase):
         result = await self.call("remove_attachment", attachment_index=1)
         self.assertEqual(result["draft"]["attachments"], [{"index": 1, "name": "answer.pdf"}])
         self.no_submit()
+
+
+    async def test_preview_replay_rejects_expired_draft_and_unrotated_content_change(self):
+        from copy import deepcopy
+        await self.call("preview")
+        original = deepcopy(self.draft)
+        for changes in ({"expires_at": 0}, {"content": "different body"}):
+            self.plugin._drafts[self.event.unified_msg_origin] = {**deepcopy(original), **changes}
+            self.assertFalse((await self.call("preview"))["prepared"])
+        self.plugin.context.send_message.assert_awaited_once()
+        self.no_submit()
+
+    async def test_preview_replay_rejects_expired_or_invalidated_confirmation_window(self):
+        await self.call("preview")
+        window = self.plugin._poke_windows[self.event.unified_msg_origin]
+        original_expiry = window["expires"]
+        window["expires"] = 0
+        self.assertFalse((await self.call("preview"))["prepared"])
+        window["expires"] = original_expiry
+        window["ready"] = False
+        self.assertFalse((await self.call("preview"))["prepared"])
+        self.plugin.context.send_message.assert_awaited_once()
+        self.no_submit()
+
+    async def test_preview_replay_checks_account_again(self):
+        await self.call("preview")
+        self.plugin._account.return_value = {"username": "changed"}
+        with self.assertRaises(ValueError):
+            await self.call("preview")
+        self.plugin.context.send_message.assert_awaited_once()
+        self.no_submit()
+
+
+    async def test_preview_changed_during_delivery_never_returns_old_success_metadata(self):
+        async def changed_during_delivery(*_args):
+            self.draft["content"] = "changed during send"
+        self.plugin.context.send_message.side_effect = changed_during_delivery
+        result = await self.call("preview")
+        self.assertFalse(result["prepared"])
+        self.assertNotIn("draft", result)
+        self.assertFalse((await self.call("preview"))["prepared"])
+        self.plugin.context.send_message.assert_awaited_once()
+        self.no_submit()

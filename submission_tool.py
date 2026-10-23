@@ -1,11 +1,13 @@
 """Prepare a preview from one authenticated current QQ message; never submit."""
 
 import asyncio
+import hashlib
+import json
 import re
 import secrets
+import time
 
 from .submission import DRAFT_TTL_SECONDS
-import time
 
 from aiocqhttp.event import Event
 
@@ -113,6 +115,52 @@ async def _verified_event(plugin, payload, scope, session, *, include_media=True
     return event
 
 
+def _snapshot(draft):
+    if draft is None:
+        return None
+    return hashlib.sha256(json.dumps(draft, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _receipt(payload, result, draft, *, account_username=None):
+    return {"request": dict(payload), "result": result, "snapshot": _snapshot(draft),
+            "account_username": account_username, "expires": time.monotonic() + 600}
+
+
+def _current_receipt(plugin, entry, session):
+    draft = plugin._drafts.get(session)
+    if (_snapshot(draft) != entry["snapshot"]
+            or draft is not None and draft.get("expires_at", 0) <= time.monotonic()):
+        return {"prepared": False, "submitted": False, "retryable": False,
+                "reason": "draft_changed_or_expired",
+                "text": "草稿已变化或过期，旧操作未重复执行；请重新查看预览。"}
+    if entry["result"].get("prepared"):
+        nonempty = str(draft.get("content") or "").strip() or draft.get("attachments")
+        windows = getattr(plugin, "_poke_windows" if nonempty else "_attachment_windows", {})
+        window = windows.get(session)
+        if not window or window.get("expires", 0) <= time.monotonic() or not window.get("ready", True):
+            return {"prepared": False, "submitted": False, "retryable": False,
+                    "reason": "preview_window_ended",
+                    "text": "旧预览的接收或确认窗口已结束，未重复操作；请重新查看预览后确认。"}
+    return entry["result"]
+
+
+async def _replay(plugin, entry, payload, scope, session):
+    result = _current_receipt(plugin, entry, session)
+    if result is not entry["result"]:
+        return result
+    event = await _verified_event(plugin, payload, scope, session, include_media=False)
+    draft = plugin._drafts.get(session)
+    if draft is not None:
+        account = await plugin._account(event)
+        expected = entry.get("account_username")
+        if expected is None:
+            expected = draft.get("account_username")
+        if not account or expected is None or str(account.get("username") or "") != expected:
+            raise ValueError("账号已变化，旧回执未复用；请重新创建草稿")
+    # Account lookup awaited; check the draft and window again before returning metadata.
+    return _current_receipt(plugin, entry, session)
+
+
 async def prepare_submission(plugin, payload, scope, session):
     """Revalidate the platform message and pending task before creating a local draft."""
     reference = payload.get("reference")
@@ -136,10 +184,7 @@ async def prepare_submission(plugin, payload, scope, session):
         if old:
             if old["request"] != payload:
                 raise ValueError("同一条请求已有预览，请勿重复准备其他材料")
-            current = plugin._drafts.get(session)
-            if not current or current.get("activity_id") != reference[3:]:
-                return {"prepared": False, "submitted": False, "text": "这条请求的预览已失效或结束，请重新说明需求。"}
-            return old["result"]
+            return await _replay(plugin, old, payload, scope, session)
         current = plugin._drafts.get(session)
         if current and current.get("expires_at", 0) > time.monotonic():
             return {"prepared": False, "submitted": False, "text": "已有提交草稿，请先查看 /ucloud_preview 或 /ucloud_cancel 取消，未覆盖草稿。"}
@@ -155,21 +200,20 @@ async def prepare_submission(plugin, payload, scope, session):
         draft = plugin._drafts.get(session)
         if not draft or draft.get("activity_id") != reference[3:]:
             return {"prepared": False, "submitted": False, "text": preview}
-        # The preview is delivered immediately, so its 60-second window does not start
-        # while a second model response is still being generated.
+        # Bind the receipt to exactly what was previewed, before delivery awaits.
+        result = {"prepared": True, "submitted": False, "preview_sent": True,
+                  "draft": _draft_summary(draft),
+                  "text": "已发送作业预览，等待用户确认；尚未上传或提交。"}
+        entry = _receipt(payload, result, draft, account_username=str(account.get("username") or ""))
         try:
             await plugin.context.send_message(session, event.plain_result(preview))
         except Exception:
             plugin._close_poke_window(session)
             plugin._close_attachment_window(session)
             raise
-        result = {"prepared": True, "submitted": False, "preview_sent": True,
-                  "draft": _draft_summary(draft),
-                  "text": "已发送作业预览，等待用户确认；尚未上传或提交。"}
-        plugin._prepared_tool_sources[source_id] = {
-            "request": dict(payload), "result": result, "expires": time.monotonic() + 600,
-        }
-        return result
+        plugin._prepared_tool_sources[source_id] = entry
+        return _current_receipt(plugin, entry, session)
+
 
 
 async def manage_submission(plugin, payload, scope, session):
@@ -197,11 +241,7 @@ async def manage_submission(plugin, payload, scope, session):
         if previous:
             if previous["request"] != payload:
                 raise ValueError("这条请求的草稿操作已经执行，请勿重复更改")
-            current = plugin._drafts.get(session)
-            snapshot = (current.get("activity_id"), current.get("code")) if current else None
-            if snapshot != previous["snapshot"]:
-                return {"prepared": False, "submitted": False, "text": "草稿已变化，旧操作未重复执行，请重新说明需求。"}
-            return previous["result"]
+            return await _replay(plugin, previous, payload, scope, session)
         event = await _verified_event(plugin, payload, scope, session, include_media=operation == "add_attachments")
         if not hasattr(plugin, "_submit_locks"):
             plugin._submit_locks = {}
@@ -234,13 +274,6 @@ async def manage_submission(plugin, payload, scope, session):
                         raise ValueError("本轮没有可添加的附件，请发送或引用指定图片/文件")
                     generator = plugin.attach_to_submission(event)
                 replies = [reply async for reply in generator]
-            try:
-                for reply in replies:
-                    await plugin.context.send_message(session, reply)
-            except Exception:
-                plugin._close_poke_window(session)
-                plugin._close_attachment_window(session)
-                raise
             current = plugin._drafts.get(session)
             prepared = bool(current and current.get("code") != before_code)
             result = {"prepared": prepared, "submitted": False, "preview_sent": prepared,
@@ -250,8 +283,14 @@ async def manage_submission(plugin, payload, scope, session):
                       "text": ("新预览已发送，尚未正式提交。" if prepared else
                                "草稿已取消，没有执行正式提交。" if operation == "cancel" and draft is not None and current is None else
                                "\n".join(reply if isinstance(reply, str) else reply.get_plain_text() for reply in replies)[:2000])}
-            plugin._prepared_tool_sources[cache_key] = {
-                "request": dict(payload), "result": result, "expires": time.monotonic() + 600,
-                "snapshot": (current.get("activity_id"), current.get("code")) if current else None,
-            }
-            return result
+            entry = _receipt(payload, result, current,
+                             account_username=str(account.get("username") or "") if operation != "cancel" else None)
+            try:
+                for reply in replies:
+                    await plugin.context.send_message(session, reply)
+            except Exception:
+                plugin._close_poke_window(session)
+                plugin._close_attachment_window(session)
+                raise
+            plugin._prepared_tool_sources[cache_key] = entry
+            return _current_receipt(plugin, entry, session)
