@@ -1,6 +1,7 @@
 """BUPT Teaching Cloud integration for AstrBot using direct BUPT APIs."""
 
 import asyncio
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -76,6 +77,11 @@ class Main(star.Star):
     async def initialize(self) -> None:
         """Prepare local storage and start optional new-task polling."""
         self._store_path = StarTools.get_data_dir(self.name) / "accounts.json"
+        routing = self._store_path.parent / "companion-routing"
+        if routing.is_dir() and not routing.is_symlink():
+            for marker in routing.glob("*.json"):
+                if re.fullmatch(r"[a-f0-9]{64}\.json", marker.name) and not marker.is_symlink():
+                    marker.unlink(missing_ok=True)
         if self._store_path.exists():
             try:
                 await asyncio.to_thread(self._store_path.chmod, 0o600)
@@ -1164,6 +1170,28 @@ class Main(star.Star):
         self._drafts[key] = draft
         return self._draft_preview(draft)
 
+    def _submission_route(self, event, mode):
+        """Export only a bounded QQ picker/attachment lease when Companion is installed."""
+        try:
+            from astrbot_plugin_private_companion.ucloud_submission_route import submission_wait
+        except ImportError:
+            return nullcontext()
+        if (getattr(self, "_store_path", None) is None
+                or event.get_platform_name() != "aiocqhttp"):
+            return nullcontext()
+        return submission_wait(self._store_path.parent / "companion-routing",
+                               event.get_self_id(), event.get_sender_id(), mode,
+                               reader_gid=self._store_path.parents[2].stat().st_gid)
+
+    @filter.regex(r"^(?:提交作业|云邮提交作业|帮我提交作业)[。！! ]*$")
+    async def natural_submit(self, event: AstrMessageEvent):
+        """Open the existing preview workflow; never submit from natural language."""
+        if not event.is_private_chat():
+            return
+        event.should_call_llm(False)
+        async for result in self.begin_submit(event):
+            yield result
+
     @filter.command("ucloud_submit")
     async def begin_submit(self, event: AstrMessageEvent):
         """Start a draft by assignment ID or interactive list selection."""
@@ -1229,55 +1257,59 @@ class Main(star.Star):
             for index, item in enumerate(shown, 1)
         )
         suffix = f"\n\n仅显示前 {len(shown)} 项。" if len(items) > len(shown) else ""
-        yield event.plain_result(
-            f"请选择要提交的作业：\n\n{choices}{suffix}\n\n"
-            "请在 3 分钟内直接发送序号；发送“取消”结束选择。"
-        )
+        with self._submission_route(event, "selection") as route:
+            yield event.plain_result(
+                f"请选择要提交的作业：\n\n{choices}{suffix}\n\n"
+                "请在 3 分钟内直接发送序号；发送“取消”结束选择。"
+            )
 
-        @session_waiter(180)
-        async def wait_for_assignment(
-            controller: SessionController,
-            selection_event: AstrMessageEvent,
-        ) -> None:
-            selection = str(getattr(selection_event, "message_str", "") or "").strip()
-            if selection.lower().lstrip("/") in {
-                "取消",
-                "cancel",
-                "ucloud_cancel",
-            }:
+            @session_waiter(max(1, int(route["expires_at"] - time.time())) if route else 180)
+            async def wait_for_assignment(
+                controller: SessionController,
+                selection_event: AstrMessageEvent,
+            ) -> None:
+                selection = str(getattr(selection_event, "message_str", "") or "").strip()
+                if selection.lower().lstrip("/") in {
+                    "取消",
+                    "cancel",
+                    "ucloud_cancel",
+                }:
+                    await self.context.send_message(
+                        key,
+                        MessageChain([Plain("已取消选择作业。")]),
+                    )
+                    selection_event.stop_event()
+                    controller.stop()
+                    return
+                if not selection.isascii() or not selection.isdigit():
+                    controller.keep(0)
+                    return
+                if len(selection) > 4 or not 1 <= int(selection) <= len(shown):
+                    await self.context.send_message(
+                        key,
+                        MessageChain(
+                            [Plain(f"请输入 1–{len(shown)} 的序号，或发送“取消”。")]
+                        ),
+                    )
+                    selection_event.stop_event()
+                    controller.keep(0)
+                    return
+                activity_id = str(shown[int(selection) - 1]["activityId"])
+                result = await self._prepare_submission_draft(
+                    selection_event,
+                    activity_id,
+                )
                 await self.context.send_message(
                     key,
-                    MessageChain([Plain("已取消选择作业。")]),
+                    MessageChain([Plain(result)]),
                 )
                 selection_event.stop_event()
                 controller.stop()
-                return
-            if not selection.isdigit() or not 1 <= int(selection) <= len(shown):
-                await self.context.send_message(
-                    key,
-                    MessageChain(
-                        [Plain(f"请输入 1–{len(shown)} 的序号，或发送“取消”。")]
-                    ),
-                )
-                selection_event.stop_event()
-                controller.keep(180, reset_timeout=True)
-                return
-            activity_id = str(shown[int(selection) - 1]["activityId"])
-            result = await self._prepare_submission_draft(
-                selection_event,
-                activity_id,
-            )
-            await self.context.send_message(
-                key,
-                MessageChain([Plain(result)]),
-            )
-            selection_event.stop_event()
-            controller.stop()
 
-        try:
-            await wait_for_assignment(event)
-        except TimeoutError:
-            yield event.plain_result("选择作业已超时，请重新使用 /ucloud_submit。")
+            try:
+                await wait_for_assignment(event)
+            except TimeoutError:
+                yield event.plain_result("选择作业已超时，请重新使用 /ucloud_submit。")
 
     @filter.command("ucloud_content")
     async def set_submit_content(self, event: AstrMessageEvent):
@@ -1320,65 +1352,69 @@ class Main(star.Star):
             yield event.plain_result(f"读取附件失败：{exc}")
             return
         if not incoming:
-            yield event.plain_result(
-                "已进入附件接收模式，请在 3 分钟内单独发送一个或多个图片/文件。"
-                "发送 /ucloud_cancel 可取消整个提交草稿。"
-            )
+            with self._submission_route(event, "attachment") as route:
+                yield event.plain_result(
+                    "已进入附件接收模式，请在 3 分钟内单独发送一个或多个图片/文件。"
+                    "发送 /ucloud_cancel 可取消整个提交草稿。"
+                )
 
-            @session_waiter(180)
-            async def wait_for_attachment(
-                controller: SessionController, attachment_event: AstrMessageEvent
-            ) -> None:
-                text = str(getattr(attachment_event, "message_str", "") or "").strip()
-                if text.lstrip("/") == "ucloud_cancel":
-                    self._drafts.pop(key, None)
+                @session_waiter(max(1, int(route["expires_at"] - time.time())) if route else 180)
+                async def wait_for_attachment(
+                    controller: SessionController, attachment_event: AstrMessageEvent
+                ) -> None:
+                    text = str(getattr(attachment_event, "message_str", "") or "").strip()
+                    if text.lower().lstrip("/") in {"ucloud_cancel", "取消", "cancel"}:
+                        self._drafts.pop(key, None)
+                        await self.context.send_message(
+                            key, MessageChain([Plain("已取消提交草稿。")])
+                        )
+                        attachment_event.stop_event()
+                        controller.stop()
+                        return
+                    if not any(isinstance(item, (File, Image)) for item in attachment_event.get_messages()):
+                        controller.keep(0)
+                        return
+                    try:
+                        received = await self._message_attachments(attachment_event)
+                    except (UCloudError, OSError, ValueError) as exc:
+                        await self.context.send_message(
+                            key, MessageChain([Plain(f"读取附件失败：{exc}，请重新发送。")])
+                        )
+                        attachment_event.stop_event()
+                        controller.keep(0)
+                        return
+                    if not received:
+                        await self.context.send_message(
+                            key,
+                            MessageChain([Plain("未识别到图片或文件，请重新发送附件。")]),
+                        )
+                        attachment_event.stop_event()
+                        controller.keep(0)
+                        return
+                    if len(draft["attachments"]) + len(received) > MAX_ATTACHMENTS:
+                        await self.context.send_message(
+                            key,
+                            MessageChain(
+                                [Plain(f"附件最多 {MAX_ATTACHMENTS} 个，请减少后重试。")]
+                            ),
+                        )
+                        attachment_event.stop_event()
+                        controller.keep(0)
+                        return
+                    draft["attachments"].extend(received)
+                    draft["code"] = secrets.token_hex(3).upper()
+                    draft["expires_at"] = time.monotonic() + DRAFT_TTL_SECONDS
                     await self.context.send_message(
-                        key, MessageChain([Plain("已取消提交草稿。")])
+                        key, MessageChain([Plain(self._draft_preview(draft))])
                     )
                     attachment_event.stop_event()
                     controller.stop()
-                    return
-                try:
-                    received = await self._message_attachments(attachment_event)
-                except (UCloudError, OSError, ValueError) as exc:
-                    await self.context.send_message(
-                        key, MessageChain([Plain(f"读取附件失败：{exc}，请重新发送。")])
-                    )
-                    attachment_event.stop_event()
-                    controller.keep(180, reset_timeout=True)
-                    return
-                if not received:
-                    await self.context.send_message(
-                        key,
-                        MessageChain([Plain("未识别到图片或文件，请重新发送附件。")]),
-                    )
-                    attachment_event.stop_event()
-                    controller.keep(180, reset_timeout=True)
-                    return
-                if len(draft["attachments"]) + len(received) > MAX_ATTACHMENTS:
-                    await self.context.send_message(
-                        key,
-                        MessageChain(
-                            [Plain(f"附件最多 {MAX_ATTACHMENTS} 个，请减少后重试。")]
-                        ),
-                    )
-                    attachment_event.stop_event()
-                    controller.keep(180, reset_timeout=True)
-                    return
-                draft["attachments"].extend(received)
-                draft["code"] = secrets.token_hex(3).upper()
-                draft["expires_at"] = time.monotonic() + DRAFT_TTL_SECONDS
-                await self.context.send_message(
-                    key, MessageChain([Plain(self._draft_preview(draft))])
-                )
-                attachment_event.stop_event()
-                controller.stop()
 
-            try:
-                await wait_for_attachment(event)
-            except TimeoutError:
-                yield event.plain_result("等待附件已超时，提交草稿仍保留。")
-            return
+                try:
+                    await wait_for_attachment(event)
+                except TimeoutError:
+                    yield event.plain_result("等待附件已超时，提交草稿仍保留。")
+                return
         if len(draft["attachments"]) + len(incoming) > MAX_ATTACHMENTS:
             yield event.plain_result(f"附件最多 {MAX_ATTACHMENTS} 个。")
             return

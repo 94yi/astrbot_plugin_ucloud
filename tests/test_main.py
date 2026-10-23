@@ -722,3 +722,47 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SubmissionRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_natural_entry_only_opens_existing_preview(self):
+        plugin = object.__new__(Main)
+        plugin._client = SimpleNamespace(submit_homework=AsyncMock())
+        seen = []
+        async def begin(event):
+            seen.append(event)
+            yield "请选择作业，最终需确认码"
+        plugin.begin_submit = begin
+        event = SimpleNamespace(is_private_chat=lambda: True, should_call_llm=Mock())
+        self.assertEqual(await _collect(plugin.natural_submit(event)), ["请选择作业，最终需确认码"])
+        self.assertEqual(seen, [event])
+        event.should_call_llm.assert_called_once_with(False)
+        plugin._client.submit_homework.assert_not_awaited()
+
+    async def test_route_lease_exists_only_during_current_user_wait(self):
+        try:
+            from astrbot_plugin_private_companion.ucloud_submission_route import owns_message
+        except ImportError:
+            self.skipTest("Companion integration is optional")
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(Main)
+            plugin._store_path = Path(directory) / "accounts.json"
+            event = SimpleNamespace(get_platform_name=lambda: "aiocqhttp",
+                                    get_self_id=lambda: "123", get_sender_id=lambda: "456")
+            root = Path(directory) / "companion-routing"
+            with plugin._submission_route(event, "selection"):
+                self.assertTrue(owns_message(root, "123", "456", "2"))
+                self.assertFalse(owns_message(root, "123", "999", "2"))
+            self.assertFalse(owns_message(root, "123", "456", "2"))
+
+    async def test_wrong_confirmation_code_never_calls_submit(self):
+        import time
+        plugin = object.__new__(Main)
+        plugin._submit_locks = {}
+        plugin._drafts = {"session-1": {"expires_at": time.monotonic()+180, "code": "ABC123"}}
+        plugin._client = SimpleNamespace(submit_homework=AsyncMock())
+        event = _Event()
+        event.message_str = "/ucloud_confirm WRONG"
+        output = await _collect(plugin.confirm_submission(event, "WRONG"))
+        self.assertIn("确认码不正确", "".join(output))
+        plugin._client.submit_homework.assert_not_awaited()

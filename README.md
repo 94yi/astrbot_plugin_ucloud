@@ -13,6 +13,12 @@ The protocol work is based on GPL-3.0 upstream projects, and this plugin remains
 distributed under GPL-3.0. See those projects for their license notices and
 source history.
 
+## QQ 提交入口（Companion 分流）
+
+在私聊发送“提交作业”“云邮提交作业”或“帮我提交作业”，即可进入原有作业选择和草稿预览。也可继续使用下方斜杠命令；最终上传并提交仍需一次性确认码，自然语言不会直接提交。
+
+与 Companion 同时部署时，需要其云邮路由模块和 I/O guard 配套版本。选作业和附件接收的三分钟会话以 bot/用户隔离，仅转交对应序号、取消或文件/图片；普通聊天和其他用户不会被接管。路由元数据不含账号、口令和附件内容，结束或重启后清除。独立 AstrBot 部署不依赖 Companion。
+
 ## Commands
 
 - `/ucloud_login <学号> <统一认证密码>`: verify credentials and enable reminders.
