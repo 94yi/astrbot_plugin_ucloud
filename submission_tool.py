@@ -96,6 +96,13 @@ async def prepare_submission(plugin, payload, scope, session):
         # AstrBot's file converter resolves the first segment's file_id. Convert
         # individually so mixed images and several different files stay correct.
         for segment in media:
+            if segment.get("type") == "file":
+                data = dict(segment.get("data") or {})
+                # NapCat history can name the file with `name`; AstrBot's private
+                # file converter otherwise only falls back to file/file_name.
+                if data.get("name") and not data.get("file_name"):
+                    data["file_name"] = data["name"]
+                segment = {**segment, "data": data}
             converted = await platform.convert_message(Event({**raw, "message": [segment]}))
             if converted is None or len(converted.message) != 1:
                 raise ValueError("附件未能完整读取，未创建草稿；请重新发送材料")

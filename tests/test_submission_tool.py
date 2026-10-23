@@ -126,14 +126,14 @@ class SubmissionToolTests(unittest.IsolatedAsyncioTestCase):
         self.raw["sender"] = {"user_id": 456, "nickname": "isolated"}
         self.raw["message"] = [
             {"type": "image", "data": {"file": "fake.png", "url": "https://example.com/fake.png"}},
-            {"type": "file", "data": {"file_id": "first"}},
-            {"type": "file", "data": {"file_id": "second"}},
+            {"type": "file", "data": {"file_id": "first", "name": "first.pdf"}},
+            {"type": "file", "data": {"file_id": "second", "name": "second.pdf"}},
         ]
         async def call(action, **kwargs):
             if action == "get_msg":
                 return deepcopy(self.raw)
             if action == "get_private_file_url":
-                return {"url": "https://example.com/" + kwargs["file_id"] + ".pdf", "name": kwargs["file_id"] + ".pdf"}
+                return {"url": "https://example.com/" + kwargs["file_id"]}
             self.fail("Unexpected platform action")
         adapter.bot = SimpleNamespace(call_action=AsyncMock(side_effect=call))
         self.plugin.context.platform_manager.get_insts = lambda: [adapter]
