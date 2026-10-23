@@ -8,6 +8,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -56,6 +58,8 @@ class Main(star.Star):
         self._drafts: dict[str, dict[str, Any]] = {}
         self._task_lists: dict[str, dict[str, Any]] = {}
         self._submit_locks: dict[str, asyncio.Lock] = {}
+        self._submission_files = {}
+        self._attachment_windows = {}
         self._poke_windows = {}
         self._confirmation_pokes = {}
         self._resource_lists = {}
@@ -80,6 +84,11 @@ class Main(star.Star):
     async def initialize(self) -> None:
         """Prepare local storage and start optional new-task polling."""
         self._store_path = StarTools.get_data_dir(self.name) / "accounts.json"
+        staging = self._store_path.parent / "submission-drafts"
+        if staging.is_dir() and not staging.is_symlink():
+            for item in staging.glob("draft-*"):
+                if item.is_file() and not item.is_symlink():
+                    item.unlink()
         routing = self._store_path.parent / "companion-routing"
         if routing.is_dir() and not routing.is_symlink():
             for marker in routing.glob("*.json"):
@@ -116,11 +125,15 @@ class Main(star.Star):
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+        for path in list(getattr(self, "_submission_files", {})):
+            self._remove_submission_file(path)
         self._tokens.clear()
         self._token_locks.clear()
         self._drafts.clear()
         self._task_lists.clear()
         self._submit_locks.clear()
+        for key in list(getattr(self, "_attachment_windows", {})):
+            self._close_attachment_window(key)
         for key in list(getattr(self, "_poke_windows", {})):
             self._close_poke_window(key)
 
@@ -231,8 +244,7 @@ class Main(star.Star):
         async with self._store_lock:
             return (await self._read_accounts()).get(event.unified_msg_origin)
 
-    @staticmethod
-    async def _message_attachments(event: AstrMessageEvent) -> list[dict[str, Any]]:
+    async def _message_attachments(self, event: AstrMessageEvent) -> list[dict[str, Any]]:
         """Materialize supported AstrBot media components without a proxy."""
         result: list[dict[str, Any]] = []
         for component in event.get_messages() or []:
@@ -252,14 +264,53 @@ class Main(star.Star):
             error = attachment_error(str(file_path), name)
             if error:
                 raise UCloudAPIError(f"{name}：{error}")
-            result.append({"path": str(file_path), "name": Path(name).name})
+            # The AstrBot pipeline deletes its incoming temporary images at event end.
+            # Own a private bounded copy until confirmation, cancellation or expiry.
+            stored = await self._retain_submission_file(file_path)
+            result.append({"path": stored, "name": Path(name).name})
         return result
 
+    async def _retain_submission_file(self, source):
+        directory = self._store_path.parent / "submission-drafts"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, path = tempfile.mkstemp(prefix="draft-", suffix=source.suffix, dir=directory)
+        os.close(fd)
+        try:
+            await asyncio.to_thread(shutil.copyfile, source, path)
+        except BaseException:
+            Path(path).unlink(missing_ok=True)
+            raise
+        if not hasattr(self, "_submission_files"):
+            self._submission_files = {}
+        self._refresh_submission_file(path)
+        return path
+
+    def _refresh_submission_file(self, path):
+        previous = getattr(self, "_submission_files", {}).get(path)
+        if previous:
+            previous.cancel()
+        self._submission_files[path] = asyncio.get_running_loop().call_later(
+            DRAFT_TTL_SECONDS, self._remove_submission_file, path
+        )
+
+    def _remove_submission_file(self, path):
+        timer = getattr(self, "_submission_files", {}).pop(path, None)
+        if timer:
+            timer.cancel()
+            Path(path).unlink(missing_ok=True)
+
     def _draft_preview(self, draft: dict[str, Any], event=None) -> str:
+        if event is not None:
+            self._close_attachment_window(event.unified_msg_origin)
+            self._close_poke_window(event.unified_msg_origin)
         armed = event is not None and self._arm_poke_confirmation(event, draft)
+        receiving = not armed and event is not None and self._arm_empty_draft_attachments(event)
         content = str(draft.get("content") or "")
         shown = content if len(content) <= 500 else content[:500] + "\n…（预览已截断）"
         attachments = draft.get("attachments", [])
+        for item in attachments:
+            if item.get("path") in getattr(self, "_submission_files", {}):
+                self._refresh_submission_file(item["path"])
         attachment_text = (
             "\n".join(
                 f"  {index}. {item['name']}"
@@ -273,19 +324,34 @@ class Main(star.Star):
             if int(draft.get("assignment_status", 99)) in {0, 2}
             else "首次提交"
         )
-        return (
-            f"UCloud 作业提交预览（{action}）\n"
-            f"作业：{draft['title']}\nID：{draft['activity_id']}\n"
-            f"状态：{draft['permission']}\n截止：{draft.get('deadline') or '-'}\n\n"
-            f"正文（{len(content)}/{MAX_CONTENT_LENGTH}）：\n{shown or '（无）'}\n\n"
-            f"附件（{len(attachments)}/{MAX_ATTACHMENTS}）：\n{attachment_text}\n\n"
-            + ("确认提交：60 秒内在私聊拍一下 bot，将提交以上正文和附件。\n"
-             if armed else "")
-            + f"确认码：{draft['code']}\n"
-            f"确认提交：/ucloud_confirm {draft['code']}\n"
-            "继续编辑：/ucloud_content 正文；发送附件：先 /ucloud_attach，再单独发送文件/图片；"
-            "删除附件：/ucloud_remove 序号；取消：/ucloud_cancel"
-        )
+        lines = [
+            f"作业提交预览（{action}）",
+            f"作业：{draft['title']}",
+            f"状态：{draft['permission']}",
+            f"截止：{draft.get('deadline') or '-'}",
+            "",
+            f"正文（{len(content)}/{MAX_CONTENT_LENGTH}）：",
+            shown or "（无）",
+            "",
+            f"附件（{len(attachments)}/{MAX_ATTACHMENTS}）：",
+            attachment_text,
+            "",
+        ]
+        if armed:
+            lines += ["确认提交：60 秒内拍一下 bot。", "这 60 秒内也可直接发送图片或文件，更新后重新确认。"]
+        elif receiving:
+            lines += ["草稿为空：3 分钟内直接发送图片或文件即可添加。"]
+        else:
+            lines += ["添加附件：/ucloud_attach"]
+        if content.strip() or attachments:
+            lines += [f"确认码提交：/ucloud_confirm {draft['code']}"]
+        lines += [
+            "修改正文：/ucloud_content 正文",
+            "删除附件：/ucloud_remove 序号",
+            "查看预览：/ucloud_preview",
+            "取消提交：/ucloud_cancel",
+        ]
+        return "\n".join(lines)
 
     async def _poll_loop(self) -> None:
         """Periodically send opt-in notices for newly appearing assignments."""
@@ -1177,6 +1243,61 @@ class Main(star.Star):
     def _draft_fingerprint(draft):
         return hashlib.sha256(json.dumps(draft, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
+    def _close_attachment_window(self, key):
+        window = getattr(self, "_attachment_windows", {}).pop(key, None)
+        if window:
+            window["timer"].cancel()
+            window["lease"].__exit__(None, None, None)
+
+    def _arm_empty_draft_attachments(self, event):
+        if (not hasattr(event, "get_platform_name") or event.get_platform_name() != "aiocqhttp"
+                or not event.is_private_chat() or not getattr(self, "_store_path", None)):
+            return False
+        key = event.unified_msg_origin
+        lease = self._submission_route(event, "attachment")
+        if not lease.__enter__():
+            lease.__exit__(None, None, None)
+            return False
+        if not hasattr(self, "_attachment_windows"):
+            self._attachment_windows = {}
+        self._attachment_windows[key] = {
+            "lease": lease, "expires": time.monotonic() + 180,
+            "bot": str(event.get_self_id()), "user": str(event.get_sender_id()),
+            "timer": asyncio.get_running_loop().call_later(180, self._close_attachment_window, key),
+        }
+        return True
+
+    async def handle_submission_input(self, event):
+        """Accept direct media only in the current private draft preview's bounded window."""
+        key = event.unified_msg_origin
+        window = (getattr(self, "_attachment_windows", {}).get(key)
+                  or getattr(self, "_poke_windows", {}).get(key))
+        draft = self._drafts.get(key)
+        if (not window or not draft or time.monotonic() >= window["expires"]
+                or time.monotonic() >= float(draft.get("expires_at", 0))
+                or event.get_platform_name() != "aiocqhttp" or not event.is_private_chat()
+                or str(event.get_self_id()) != window["bot"]
+                or str(event.get_sender_id()) != window["user"]):
+            return False
+        if str(getattr(event, "message_str", "") or "").strip().lower() in {"取消", "cancel"}:
+            async for result in self.cancel_submission(event):
+                await event.send(result)
+            event.stop_event()
+            return True
+        # Explicit commands retain their own handlers. Quoted images are not traversed.
+        if str(getattr(event, "message_str", "") or "").strip().startswith(("/", "ucloud_")):
+            return False
+        messages = event.get_messages() if hasattr(event, "get_messages") else []
+        if not any(isinstance(item, (File, Image)) for item in messages):
+            return False
+        # Editing ends eligibility of the previous preview before any file read awaits.
+        self._invalidate_poke_window(key)
+        event.should_call_llm(False)
+        async for result in self.attach_to_submission(event):
+            await event.send(result)
+        event.stop_event()
+        return True
+
     def _close_poke_window(self, key):
         window = getattr(self, "_poke_windows", {}).pop(key, None)
         if window:
@@ -1224,8 +1345,9 @@ class Main(star.Star):
             return False
         if not (raw.get("post_type") == "notice" and raw.get("notice_type") == "notify"
                 and raw.get("sub_type") == "poke"):
-            # Further chat or editing ends this gesture's confirmation window.
-            self._invalidate_poke_window(key)
+            # Read receipts, typing and other background notices are not user edits.
+            if raw.get("post_type") == "message":
+                self._invalidate_poke_window(key)
             return False
         actor = str(raw.get("sender_id") if raw.get("sender_id") is not None else raw.get("user_id"))
         if (raw.get("group_id") or not event.is_private_chat()
@@ -1270,7 +1392,7 @@ class Main(star.Star):
                                event.get_self_id(), event.get_sender_id(), mode,
                                reader_gid=self._store_path.parents[2].stat().st_gid)
 
-    @filter.regex(r"^(?:提交作业|云邮提交作业|帮我提交作业)[。！! ]*$")
+    @filter.regex(r"^(?:提交作业|云邮提交作业|帮我提交作业|交作业|帮我交作业)[。！! ]*$")
     async def natural_submit(self, event: AstrMessageEvent):
         """Open the existing preview workflow; never submit from natural language."""
         if not event.is_private_chat():
@@ -1513,13 +1635,17 @@ class Main(star.Star):
             yield event.plain_result("当前没有提交草稿。")
             return
         if target in {"全部", "all"}:
+            removed = draft["attachments"]
             draft["attachments"] = []
+            for item in removed:
+                self._remove_submission_file(item.get("path"))
         else:
             try:
                 index = int(target) - 1
                 if index < 0:
                     raise ValueError
-                draft["attachments"].pop(index)
+                removed = draft["attachments"].pop(index)
+                self._remove_submission_file(removed.get("path"))
             except (ValueError, IndexError):
                 yield event.plain_result(
                     "用法：/ucloud_remove 附件序号；或 /ucloud_remove 全部。"
@@ -1544,7 +1670,12 @@ class Main(star.Star):
     @filter.command("ucloud_cancel")
     async def cancel_submission(self, event: AstrMessageEvent):
         """Discard the current in-memory submission draft."""
-        removed = self._drafts.pop(event.unified_msg_origin, None)
+        key = event.unified_msg_origin
+        removed = self._drafts.pop(key, None)
+        self._close_attachment_window(key)
+        self._close_poke_window(key)
+        for item in (removed or {}).get("attachments", []):
+            self._remove_submission_file(item.get("path"))
         yield event.plain_result(
             "已取消提交草稿。" if removed else "当前没有提交草稿。"
         )
@@ -1633,6 +1764,8 @@ class Main(star.Star):
             current = self._drafts.get(key)
             if current and current.get("code") == code.upper():
                 self._drafts.pop(key, None)
+                for item in draft["attachments"]:
+                    self._remove_submission_file(item.get("path"))
             yield event.plain_result(
                 f"提交成功：{draft['title']}（{draft['activity_id']}）。"
             )
