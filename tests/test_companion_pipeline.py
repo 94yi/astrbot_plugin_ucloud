@@ -24,6 +24,12 @@ class CompanionPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_process_stage_keeps_submission_after_three_consumed_handlers(
         self,
     ):
+        await self.verify_entry("提交作业", "提交作业", "natural_submit")
+
+    async def test_slash_entry_survives_wake_prefix_removal(self):
+        await self.verify_entry("/ucloud_submit", "ucloud_submit", "begin_submit")
+
+    async def verify_entry(self, original, normalized, entry):
         guard = self.load_guard()
         from astrbot.api.platform import (
             AstrBotMessage,
@@ -45,9 +51,10 @@ class CompanionPipelineTests(unittest.IsolatedAsyncioTestCase):
         msg.type = MessageType.FRIEND_MESSAGE
         msg.self_id = "999999999991"
         msg.sender = MessageMember(user_id="999999999992", nickname="isolated")
-        msg.message = [Plain("提交作业")]
+        msg.message = [Plain(original)]
+        msg.message_str = original
         event = AiocqhttpMessageEvent(
-            "提交作业",
+            normalized,
             msg,
             PlatformMetadata(name="aiocqhttp", description="isolated", id="isolated"),
             "999999999992",
@@ -86,7 +93,7 @@ class CompanionPipelineTests(unittest.IsolatedAsyncioTestCase):
         ]
         handlers += [
             handler("platform_only", guard_module, route),
-            handler("natural_submit", cloud_module, plugin.natural_submit),
+            handler(entry, cloud_module, getattr(plugin, entry)),
         ]
         event.set_extra("activated_handlers", handlers)
         event.set_extra("handlers_parsed_params", {})
