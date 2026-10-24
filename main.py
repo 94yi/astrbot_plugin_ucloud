@@ -23,6 +23,12 @@ from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 from astrbot.api.web import request
 
+from astrbot_plugin_private_companion.ucloud_submission import (
+    SubmissionRejected,
+    prepare_remote_draft,
+    submit_confirmed_draft,
+)
+
 from .downloads import DownloadStore, checked_url
 from .stream_proxy import DownloadProxy
 from .submission import (
@@ -32,8 +38,6 @@ from .submission import (
     TASK_LIST_TTL_SECONDS,
     attachment_error,
     command_tail,
-    resolve_group_id,
-    submission_permission,
 )
 from .ucloud_client import (
     DirectUCloudClient,
@@ -1172,62 +1176,17 @@ class Main(star.Star):
             return "尚未登录。请先使用 /ucloud_login 学号 统一认证密码。"
         try:
             userinfo = await self._userinfo(account)
-            detail = await self._client.get_homework(userinfo, activity_id)
-            if not self._has_homework_detail(detail):
-                return "该任务尚未返回可识别的作业详情，未创建提交草稿；请查看教学云对应页面。"
-            if expected_course:
-                course_info = detail.get("courseInfo") or {}
-                names = [detail.get("courseName"), detail.get("siteName")]
-                if isinstance(course_info, dict):
-                    names += [course_info.get("name"), course_info.get("courseName"), course_info.get("siteName")]
-                normalize = lambda text: re.sub(r"\s+", "", str(text or "")).casefold()
-                if normalize(expected_course) not in {normalize(name) for name in names if name}:
-                    return "作业详情与指定课程不匹配或课程名尚未核实，未创建草稿；请先确认课程和作业。"
-            state = await self._client.get_submission_state(userinfo, activity_id)
-            allowed, permission = submission_permission(state)
-            if not allowed:
-                return permission
-            assignment_type = int(detail.get("assignmentType", 0))
-            if assignment_type not in {0, 1}:
-                return "该任务返回的提交类型尚未接入，未创建提交草稿；请在教学云页面操作。"
-            task: dict[str, Any] = {}
-            if assignment_type == 1:
-                undone = await self._client.get_undone_list(userinfo)
-                for item in undone.get("undoneList", []):
-                    if (
-                        isinstance(item, dict)
-                        and str(item.get("activityId")) == activity_id
-                    ):
-                        task = item
-                        break
-            group_id = resolve_group_id(task, detail, state)
-            if assignment_type == 1 and not group_id:
-                return (
-                    "这是小组作业，但教学云接口未返回当前学生组 ID；"
-                    "为避免交到错误小组，请在网页端提交。"
-                )
-            content = (
-                str(state.get("assignmentContent") or "")
-                if supplied_content is None
-                else supplied_content
-            ).rstrip()
-            if len(content) > MAX_CONTENT_LENGTH:
-                return f"正文不能超过 {MAX_CONTENT_LENGTH} 字。"
-            remote_ids = state.get("attachmentIds", [])
-            if not isinstance(remote_ids, list):
-                remote_ids = []
-            attachments = [
-                {
-                    "name": f"已有附件 {index}",
-                    "resource_id": str(resource_id),
-                }
-                for index, resource_id in enumerate(remote_ids, 1)
-                if resource_id not in (None, "")
-            ]
+            fields = await prepare_remote_draft(
+                self._client, userinfo, activity_id, supplied_content,
+                expected_course=expected_course,
+            )
+            attachments = fields["attachments"]
             incoming = await self._message_attachments(event)
             if len(attachments) + len(incoming) > MAX_ATTACHMENTS:
                 return f"附件最多 {MAX_ATTACHMENTS} 个。"
             attachments.extend(incoming)
+        except SubmissionRejected as exc:
+            return str(exc)
         except (httpx.HTTPError, UCloudError, OSError, ValueError) as exc:
             logger.warning(
                 "Unable to prepare UCloud submission: %s: %s",
@@ -1235,22 +1194,9 @@ class Main(star.Star):
                 exc,
             )
             return f"无法创建提交草稿：{exc}"
-        try:
-            assignment_status = int(state.get("assignmentStatus", 99))
-        except (TypeError, ValueError):
-            assignment_status = 99
         draft = {
+            **fields,
             "account_username": str(account.get("username") or ""),
-            "activity_id": activity_id,
-            "title": str(detail.get("assignmentTitle") or "未命名作业"),
-            "deadline": str(detail.get("assignmentEndTime") or ""),
-            "assignment_type": assignment_type,
-            "assignment_status": assignment_status,
-            "group_id": group_id,
-            "commit_id": str(state.get("commitId") or ""),
-            "content": content,
-            "attachments": attachments,
-            "permission": permission,
             "code": secrets.token_hex(3).upper(),
             "expires_at": time.monotonic() + DRAFT_TTL_SECONDS,
         }
@@ -1736,37 +1682,10 @@ class Main(star.Star):
                 return
             try:
                 userinfo = await self._userinfo(account)
-                fresh = await self._client.get_submission_state(
-                    userinfo, draft["activity_id"]
-                )
-                allowed, reason = submission_permission(fresh)
-                if not allowed:
-                    yield event.plain_result(f"提交前状态复核未通过：{reason}")
-                    return
-                fresh_commit_id = str(fresh.get("commitId") or "")
-                if fresh_commit_id != str(draft.get("commit_id") or ""):
-                    yield event.plain_result(
-                        "检测到该作业已在其他页面发生变化，未执行提交；请取消后重新创建草稿。"
-                    )
-                    return
-                resource_ids: list[str] = []
-                for item in draft["attachments"]:
-                    resource_id = str(item.get("resource_id") or "")
-                    if not resource_id:
-                        resource_id = await self._client.upload_attachment(
-                            userinfo, item["path"], filename=item["name"]
-                        )
-                        item["resource_id"] = resource_id
-                    resource_ids.append(resource_id)
-                await self._client.submit_homework(
-                    userinfo,
-                    draft["activity_id"],
-                    str(draft.get("content") or ""),
-                    resource_ids,
-                    assignment_type=int(draft["assignment_type"]),
-                    group_id=str(draft.get("group_id") or ""),
-                    commit_id=fresh_commit_id,
-                )
+                await submit_confirmed_draft(self._client, userinfo, draft)
+            except SubmissionRejected as exc:
+                yield event.plain_result(str(exc))
+                return
             except (httpx.HTTPError, UCloudError, OSError, ValueError) as exc:
                 logger.warning(
                     "UCloud submission failed: %s: %s", type(exc).__name__, exc
