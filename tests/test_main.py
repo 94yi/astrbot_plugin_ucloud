@@ -585,7 +585,8 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("1. 作业一", replies[0])
         self.assertIn("2. 作业二", replies[0])
-        self.assertIn("/ucloud_submit 序号", replies[0])
+        self.assertIn("/ucloud_detail 序号", replies[0])
+        self.assertNotIn("/ucloud_submit", replies[0])
         self.assertEqual(
             plugin._resolve_task_reference("session-1", "2"),
             ("1002", ""),
@@ -608,7 +609,7 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
             ("100200", ""),
         )
 
-    async def test_non_assignment_detail_does_not_call_homework_api(self) -> None:
+    async def test_unknown_list_type_still_reads_actual_homework_detail(self) -> None:
         plugin = object.__new__(Main)
         plugin._store_lock = asyncio.Lock()
         plugin._task_lists = {}
@@ -628,13 +629,13 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
         plugin._read_accounts = AsyncMock(
             return_value={"session-1": {"username": "student"}}
         )
-        plugin._fetch = AsyncMock()
+        plugin._fetch = AsyncMock(return_value={"assignmentTitle": "实际作业", "assignmentContent": "提交实验报告"})
 
         replies = await _collect(plugin.detail(_Event(), "1"))
 
-        self.assertIn("登录状态正常", replies[0])
-        self.assertIn("学习活动", replies[0])
-        plugin._fetch.assert_not_awaited()
+        self.assertIn("实际作业", replies[0])
+        self.assertNotIn("不是作业", replies[0])
+        plugin._fetch.assert_awaited_once_with({"username": "student"}, "/homework?id=unit-1")
 
     async def test_submit_picker_maps_reply_number_to_snapshot(self) -> None:
         selected: list[str] = []
@@ -722,3 +723,47 @@ class MainAccountTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SubmissionRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_natural_entry_only_opens_existing_preview(self):
+        plugin = object.__new__(Main)
+        plugin._client = SimpleNamespace(submit_homework=AsyncMock())
+        seen = []
+        async def begin(event):
+            seen.append(event)
+            yield "请选择作业，最终需确认码"
+        plugin.begin_submit = begin
+        event = SimpleNamespace(is_private_chat=lambda: True, should_call_llm=Mock())
+        self.assertEqual(await _collect(plugin.natural_submit(event)), ["请选择作业，最终需确认码"])
+        self.assertEqual(seen, [event])
+        event.should_call_llm.assert_called_once_with(False)
+        plugin._client.submit_homework.assert_not_awaited()
+
+    async def test_route_lease_exists_only_during_current_user_wait(self):
+        try:
+            from astrbot_plugin_private_companion.ucloud_submission_route import owns_message
+        except ImportError:
+            self.skipTest("Companion integration is optional")
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = object.__new__(Main)
+            plugin._store_path = Path(directory) / "accounts.json"
+            event = SimpleNamespace(get_platform_name=lambda: "aiocqhttp",
+                                    get_self_id=lambda: "123", get_sender_id=lambda: "456")
+            root = Path(directory) / "companion-routing"
+            with plugin._submission_route(event, "selection"):
+                self.assertTrue(owns_message(root, "123", "456", "2"))
+                self.assertFalse(owns_message(root, "123", "999", "2"))
+            self.assertFalse(owns_message(root, "123", "456", "2"))
+
+    async def test_wrong_confirmation_code_never_calls_submit(self):
+        import time
+        plugin = object.__new__(Main)
+        plugin._submit_locks = {}
+        plugin._drafts = {"session-1": {"expires_at": time.monotonic()+180, "code": "ABC123"}}
+        plugin._client = SimpleNamespace(submit_homework=AsyncMock())
+        event = _Event()
+        event.message_str = "/ucloud_confirm WRONG"
+        output = await _collect(plugin.confirm_submission(event, "WRONG"))
+        self.assertIn("确认码不正确", "".join(output))
+        plugin._client.submit_homework.assert_not_awaited()

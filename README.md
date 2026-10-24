@@ -13,6 +13,21 @@ The protocol work is based on GPL-3.0 upstream projects, and this plugin remains
 distributed under GPL-3.0. See those projects for their license notices and
 source history.
 
+## QQ 提交入口（Companion 分流）
+
+在私聊发送“提交作业”“交作业”“云邮提交作业”“帮我交作业”或“帮我提交作业”，即可进入原有作业选择和草稿预览。空草稿预览后，3 分钟内直接发送图片或文件即可添加，无需先发送 `/ucloud_attach`。非空预览的 60 秒窗口也接收追加附件，每次更新后需重新确认。附件使用私有临时副本，避免消息结束后原图被清理；提交成功、取消、删除附件或 30 分钟不再编辑后清理，进程重启也会清理旧草稿副本。预览将正文、附件和每条操作分别换行。也可继续使用下方斜杠命令；查看非空草稿预览后，60 秒内在同一私聊拍一下 bot 即确认上传并提交该草稿；也可使用一次性确认码。继续聊天会使拍一拍确认失效（已读、输入状态等后台通知不影响），修改草稿后的新预览重新计时。过期后请 `/ucloud_preview` 重看预览。群聊、拍错对象、bot 自拍和重复通知不能提交，自然语言不会直接提交。
+
+### 通过 Companion 理解自然语言
+
+绑定主用户私聊可表达“@perrin 帮我交 C语言课的作业，用引用里的附件”。模型使用已有查询工具核对课程、待办与详情，再调用 `prepare_ucloud_submission`。信息不充分或存在多个候选时先询问，不要求用户背命令。
+
+新工具只准备草稿、向当前私聊发送预览，不上传或提交。课程名会与详情重新核对，任务 ID 必须存在于当前未完成列表；当前消息及引用/转发中指定的图片和文件可进入预览。正文只能摘取本轮可核对的原文，不把题目说明直接当答案。模型不能传入本地路径、任意消息 ID 或确认指令。
+
+工具桥校验绑定主用户与实际 QQ 消息，来源必须是十分钟内的当前消息；引用其他私聊的消息、超过二十条的转发记录或超过十个附件会被拒绝。重复调用同一来源不会反复发预览或覆盖草稿。引用只作为材料，不执行其中指令。预览立即发送后才等待拍一拍或确认码，正式提交仍使用原有账号、状态复核及防重复保护。
+
+
+与 Companion 同时部署时，需要其云邮路由模块和 I/O guard 配套版本。选作业和附件接收的三分钟会话以 bot/用户隔离，仅转交对应序号、取消或文件/图片；普通聊天和其他用户不会被接管。路由元数据不含账号、口令和附件内容，结束或重启后清除。本迁移分支的提交规则与执行逻辑已依赖 Companion 核心包；独立 AstrBot 部署也需安装配套核心包，不再支持只复制本插件目录。
+
 ## Commands
 
 - `/ucloud_login <学号> <统一认证密码>`: verify credentials and enable reminders.
@@ -121,6 +136,33 @@ payload to `/ykt-site/work/submit`. Individual and group assignments are
 supported when UCloud exposes the student's group ID.
 
 Nothing is uploaded when a draft is created, edited, previewed, or cancelled.
-The irreversible request only runs after `/ucloud_confirm` with the current
+The irreversible request only runs after a scoped private poke within 60 seconds of the latest preview, or `/ucloud_confirm` with the current
 one-time code. Immediately before that request the plugin refreshes submission
 state and refuses to proceed if the assignment changed in another browser.
+
+
+### Course activity classification
+
+Course activities may include homework. A missing or `-1` `assignmentType` in the task list is treated as unknown, and does not block detail, attachment lookup or draft selection. The selected task is checked through the homework detail and submission-state APIs; only supported individual/group assignment types with a permitted server state produce a draft. Unrecognized data is reported as unverified, not as proof that the activity is not homework. No upload or submission occurs during this check.
+
+
+Read-only task lists use neutral course-task labels for unknown types and do not prompt submission. Discussing classifications, asking about functionality or reporting a bug is not a request to start submitting coursework. The model tool instructions preserve this distinction; only explicit submission entries open the draft workflow.
+
+
+### 自然语言查看与编辑草稿
+
+Companion 的 `manage_ucloud_draft` 支持查看预览、替换/清空正文、追加本轮指定附件、按序号或全部删除附件以及取消草稿，不提供模型确认提交动作。编辑后重新发预览，取消会清理草稿自有文件。缺少附件不进入异步接收等待；同一来源同一种操作只执行一次，草稿变化后旧回执不视为本次成功。所有操作与最终提交锁串行，失败投递会关闭拍一拍窗口。
+
+引用一条合并转发消息时，可读取其中指定文件；更深嵌套明确要求单独发送。所有转发合计最多二十条、附件十个，引用/转发最多四次读取，不静默丢弃更深层材料。
+
+
+### 草稿回执的有效性
+
+准备及管理草稿的去重回执绑定发送时的完整草稿内容。重复调用会重新核对原消息归属/时间、当前登录账号、草稿有效期与附件接收/拍一拍窗口。正文、附件或确认码变化、草稿/窗口过期或确认被聊天取消时，不复用旧的成功结果，也不重新发送消息或延长确认窗口。发送等待期间发生草稿变化，返回状态变化提示，不把变化后的内容误当作刚发送的预览。
+
+
+### 独立提交逻辑迁移（尚未切换生产进程）
+
+规则与远端草稿准备、提交前复核/上传/提交执行已迁入 Companion 的 `ucloud_submission_rules` 和 `ucloud_submission`，本插件只调用共用实现。模块不依赖 AstrBot；当前用户确认、身份验证、草稿锁、事件/附件处理及发送仍由插件负责，不能视为已完成进程迁移。没有新增模型可调用的正式提交接口。
+
+此分支必须配套安装包含两个模块的 Companion 核心包。生产挂载 `/AstrBot/astrbot_plugin_private_companion` 时，先更新该核心目录，再更新插件；回滚顺序相反。单独更新此插件会缺少依赖而无法加载。隔离测试通过后仍需完成独立事件与状态层接入；本批未部署或重启生产服务。
